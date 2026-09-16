@@ -7,7 +7,7 @@
 默认镜像：
 
 ```text
-ghcr.io/wgu76989-arch/guardian-backend:latest
+ghcr.io/dogwalkerg/guardian-backend:latest
 ```
 
 GitHub Actions 工作流位于 `.github/workflows/docker-publish.yml`，推送到 `main` 或 `v*.*.*` 标签后自动构建并发布 `linux/amd64` 镜像。
@@ -31,3 +31,4 @@ curl http://127.0.0.1:18080/health
 ```
 
 API 通过宝塔反向代理到 `http://127.0.0.1:18080`，WebSocket 路径为 `/ws`。
+

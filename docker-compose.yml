@@ -1,7 +1,7 @@
 services:
   guardian-api:
     build: .
-    image: ${GUARDIAN_IMAGE:-ghcr.io/wgu76989-arch/guardian-backend:latest}
+    image: ${GUARDIAN_IMAGE:-ghcr.io/dogwalkerg/guardian-backend:latest}
     container_name: guardian-api
     restart: unless-stopped
     env_file: .env
@@ -21,7 +21,7 @@ services:
       retries: 3
 
   guardian-worker:
-    image: ${GUARDIAN_IMAGE:-ghcr.io/wgu76989-arch/guardian-backend:latest}
+    image: ${GUARDIAN_IMAGE:-ghcr.io/dogwalkerg/guardian-backend:latest}
     container_name: guardian-worker
     restart: unless-stopped
     env_file: .env
@@ -73,4 +73,5 @@ networks:
 volumes:
   guardian_postgres_data:
   guardian_redis_data:
+
 

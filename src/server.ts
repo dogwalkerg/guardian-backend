@@ -1,0 +1,42 @@
+import Fastify from 'fastify';
+import cors from '@fastify/cors';
+import helmet from '@fastify/helmet';
+import jwt from '@fastify/jwt';
+import rateLimit from '@fastify/rate-limit';
+import websocket from '@fastify/websocket';
+import fastifyStatic from '@fastify/static';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { config } from './config.js';
+import { pool } from './db.js';
+import { registerRoutes } from './routes.js';
+
+const app = Fastify({
+  logger: {
+    level: config.logLevel,
+    transport: config.nodeEnv === 'development' ? { target: 'pino-pretty', options: { translateTime: 'SYS:standard' } } : undefined
+  },
+  bodyLimit: 5 * 1024 * 1024
+});
+
+await app.register(cors, { origin: config.corsOrigin, credentials: true });
+await app.register(helmet, { contentSecurityPolicy: false });
+await app.register(jwt, { secret: config.jwtSecret, sign: { expiresIn: '30d' } });
+await app.register(rateLimit, { max: 120, timeWindow: '1 minute' });
+await app.register(websocket);
+await app.register(fastifyStatic, { root: path.join(path.dirname(fileURLToPath(import.meta.url)), '../public'), prefix: '/admin/' });
+await registerRoutes(app);
+app.get('/', async (_request, reply) => reply.redirect('/admin/'));
+app.get('/admin', async (_request, reply) => reply.redirect('/admin/'));
+
+app.addHook('onClose', async () => { await pool.end(); });
+
+try {
+  await app.listen({ host: config.host, port: config.port });
+  app.log.info(`guardian backend listening on ${config.host}:${config.port}`);
+} catch (error) {
+  app.log.error(error);
+  process.exit(1);
+}
+
+

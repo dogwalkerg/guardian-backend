@@ -11,8 +11,7 @@ export async function issueToken(app: FastifyInstance, user: AuthUser) {
 }
 
 export async function getAuthUser(app: FastifyInstance, request: FastifyRequest): Promise<AuthUser> {
-  await request.jwtVerify();
-  const payload = request.user as { sub?: string; phone?: string; familyId?: string; role?: string };
+  const payload = await verifyJwtCompat(app, request) as { sub?: string; phone?: string; familyId?: string; role?: string };
   if (payload.role === 'admin' || !payload.sub || !payload.phone || !payload.familyId) {
     throw new Error('parent token required');
   }
@@ -24,10 +23,20 @@ export async function issueAdminToken(app: FastifyInstance, username: string) {
 }
 
 export async function getAdminUser(app: FastifyInstance, request: FastifyRequest): Promise<AdminUser> {
-  await request.jwtVerify();
-  const payload = request.user as { role?: string; username?: string };
+  const payload = await verifyJwtCompat(app, request) as { role?: string; username?: string };
   if (payload.role !== 'admin' || !payload.username) throw new Error('admin token required');
   return { role: 'admin', username: payload.username };
+}
+
+async function verifyJwtCompat(app: FastifyInstance, request: FastifyRequest) {
+  const authorization = String(request.headers.authorization ?? '').trim();
+  // The installed parent APK sends the JWT directly. The administrator console
+  // and standard clients send the normal "Bearer <JWT>" form, so accept both.
+  if (authorization && !/^Bearer\s+/i.test(authorization)) {
+    return app.jwt.verify(authorization);
+  }
+  await request.jwtVerify();
+  return request.user;
 }
 
 export function hashToken(value: string) {

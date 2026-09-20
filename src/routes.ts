@@ -519,22 +519,24 @@ export async function registerRoutes(app: FastifyInstance) {
 
   app.post('/api/v1/auth/account/sendCaptcha', async (request: any) => {
     const body = request.body ?? {};
-    const phone = String(body.phone ?? '').trim();
-    if (!phone) return { error: 'phone is required' };
+    const phone = String(body.phone ?? body.username ?? body.mobile ?? '').trim();
+    if (!phone) return { code: 40001, message: '手机号不能为空', data: null };
     const code = config.allowFixedCaptcha ? config.fixedCaptcha : String(Math.floor(100000 + Math.random() * 900000));
     await query(`INSERT INTO captcha_codes(phone,code,expires_at) VALUES ($1,$2,now()+interval '10 minutes') ON CONFLICT(phone) DO UPDATE SET code=EXCLUDED.code,expires_at=EXCLUDED.expires_at`, [phone, code]);
-    request.log.info({ phone, code: config.allowFixedCaptcha ? code : '[redacted]' }, 'captcha issued');
-    return { data: { sent: true, expiresIn: 600, ...(config.nodeEnv !== 'production' ? { devCode: code } : {}) } };
+    request.log.info({ phone, fixedCaptcha: config.allowFixedCaptcha }, 'captcha issued');
+    return { code: 0, message: '验证码已发送', data: { sent: true, expiresIn: 600, ...(config.allowFixedCaptcha ? { fixedCode: code } : {}) } };
   });
 
   app.post('/api/v1/auth/account/captchaLogin', async (request: any, reply) => {
     const body = request.body ?? {};
-    const phone = String(body.phone ?? '').trim();
+    const phone = String(body.phone ?? body.username ?? body.mobile ?? '').trim();
     const code = String(body.code ?? body.captcha ?? '').trim();
-    if (!phone || !code || !(await verifyCaptcha(phone, code, config.allowFixedCaptcha, config.fixedCaptcha))) return reply.code(401).send({ message: '验证码错误或已过期' });
+    if (!phone || !code || !(await verifyCaptcha(phone, code, config.allowFixedCaptcha, config.fixedCaptcha))) {
+      return reply.code(401).send({ code: 40101, message: '验证码错误或已过期', data: null });
+    }
     const record = await ensureUserAndFamily(phone);
     const token = await issueToken(app, { id: record.id, phone: record.phone, familyId: record.family_id });
-    return { data: { token, accessToken: token, userId: record.id, familyId: record.family_id }, token };
+    return { code: 0, message: '登录成功', data: { token, accessToken: token, userId: record.id, familyId: record.family_id }, token };
   });
 
   app.get('/api/v1/auth/account/userAgreement', async () => ({ data: { title: '用户协议', content: '请在正式上线前补充用户协议内容。' } }));

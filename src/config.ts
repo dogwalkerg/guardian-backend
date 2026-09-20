@@ -22,8 +22,10 @@ export const config = {
   updateEnabled: (process.env.UPDATE_ENABLED ?? 'true') === 'true',
   databaseUrl: required('DATABASE_URL', 'postgres://guardian:guardian_dev_password@localhost:5432/guardian'),
   redisUrl: required('REDIS_URL', 'redis://localhost:6379'),
-  allowFixedCaptcha: (process.env.DEV_ALLOW_FIXED_CAPTCHA ?? 'false') === 'true',
-  fixedCaptcha: process.env.FIXED_CAPTCHA ?? '123456',
+  // The installed parent APK has no SMS provider integration. This deployment
+  // intentionally uses the fixed six-digit test code requested by the owner.
+  allowFixedCaptcha: true,
+  fixedCaptcha: '123456',
   corsOrigin: process.env.CORS_ORIGIN ?? true,
   logLevel: process.env.LOG_LEVEL ?? 'info'
 };

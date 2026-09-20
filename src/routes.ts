@@ -315,23 +315,8 @@ export async function registerRoutes(app: FastifyInstance) {
   });
 
   app.post('/api/v1/admin/families/:familyId/bind-code', async (request: any, reply) => {
-    const admin = await requireAdmin(request, reply); if (!admin) return;
-    const familyId = String(request.params.familyId); const name = String((request.body ?? {}).name ?? '孩子').trim() || '孩子';
-    const family = await query<{ id: string }>('SELECT id FROM families WHERE id=$1', [familyId]);
-    if (!family.rows[0]) return reply.code(404).send({ message: '家庭不存在' });
-    let token = '';
-    for (let attempt = 0; attempt < 8; attempt += 1) {
-      const candidate = String(Math.floor(100000 + Math.random() * 900000));
-      const exists = await query('SELECT 1 FROM bind_tokens WHERE token=$1 AND expires_at>now()', [candidate]);
-      if (!exists.rows[0]) { token = candidate; break; }
-    }
-    if (!token) return reply.code(503).send({ message: '暂时无法生成绑定码，请重试' });
-    const child = await query<{ id: string }>('INSERT INTO children(family_id,name) VALUES($1,$2) RETURNING id', [familyId, name]);
-    await query('INSERT INTO bind_tokens(token,family_id,child_id,expires_at) VALUES($1,$2,$3,now()+interval \'10 minutes\')', [token, familyId, child.rows[0].id]);
-    await query('INSERT INTO admin_audit_logs(username,action,family_id,child_id,detail) VALUES($1,$2,$3,$4,$5::jsonb)', [admin.username, 'bind_code_created', familyId, child.rows[0].id, JSON.stringify({ name, expiresIn: 600 })]);
-    const childId = child.rows[0].id;
-    const url = `guardian://bind?childId=${encodeURIComponent(childId)}&code=${token}`;
-    return { code: 0, data: { code: token, bindCode: token, childId, url, content: url, expiresIn: 600, expiresAt: new Date(Date.now() + 600_000).toISOString() } };
+    if (!await requireAdmin(request, reply)) return;
+    return reply.code(403).send({ message: '绑定码只能由家长端打开绑定页面生成' });
   });
 
   app.get('/api/v1/admin/bind-codes', async (request: any, reply) => {

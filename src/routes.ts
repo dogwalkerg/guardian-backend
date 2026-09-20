@@ -578,7 +578,7 @@ export async function registerRoutes(app: FastifyInstance) {
 
   app.get('/api/v1/parent/index/childUserList', async (request: any) => {
     const user = await getAuthUser(app, request);
-    const result = await query(`SELECT c.id AS "childId",c.name,c.phone,c.avatar_url AS "avatarUrl",d.id AS "deviceId",d.device_name AS "phoneName",d.brand,d.model,d.android_version AS "androidVersion",d.client_version AS "clientVersion",d.online,d.battery,d.last_seen_at AS "lastSeenAt" FROM children c LEFT JOIN LATERAL (SELECT * FROM devices x WHERE x.child_id=c.id ORDER BY x.updated_at DESC LIMIT 1) d ON true WHERE c.family_id=$1 AND c.active=true ORDER BY c.created_at`, [user.familyId]);
+    const result = await query(`SELECT c.id AS "childId",c.name,c.phone,c.avatar_url AS "avatarUrl",d.id AS "deviceId",d.device_name AS "phoneName",d.brand,d.model,d.model AS "phoneModel",d.android_version AS "androidVersion",d.client_version AS "clientVersion",d.online,CASE WHEN COALESCE(d.online,false) THEN 1 ELSE 0 END AS status,CASE WHEN COALESCE(d.online,false) THEN 1 ELSE 0 END AS "onLineStatus",d.battery,COALESCE(d.battery,0) AS "batteryPercent",d.last_seen_at AS "lastSeenAt" FROM children c LEFT JOIN LATERAL (SELECT * FROM devices x WHERE x.child_id=c.id ORDER BY x.updated_at DESC LIMIT 1) d ON true WHERE c.family_id=$1 AND c.active=true ORDER BY c.created_at`, [user.familyId]);
     return { data: result.rows };
   });
 
@@ -612,7 +612,7 @@ export async function registerRoutes(app: FastifyInstance) {
 
   app.post('/api/v1/parent/index/getDeviceInfo', async (request: any) => {
     const user = await getAuthUser(app, request); const childId = String((request.body ?? {}).childId ?? '');
-    const result = await query(`SELECT d.id AS "deviceId",d.child_id AS "childId",d.device_name AS "deviceName",d.brand,d.model,d.android_version AS "androidVersion",d.client_version AS "clientVersion",d.battery,d.network_type AS "networkType",d.online,d.last_heartbeat_at AS "lastHeartbeatAt",d.last_seen_at AS "lastSeenAt",d.permissions,d.metadata,d.step_count AS "stepCount",d.current_app_package AS "currentAppPackage",d.current_app_name AS "currentAppName",d.control_status AS "controlStatus",d.last_location_at AS "lastLocationAt",d.last_usage_sync_at AS "lastUsageSyncAt",d.last_apps_sync_at AS "lastAppsSyncAt" FROM devices d JOIN children c ON c.id=d.child_id WHERE d.child_id=$1 AND c.family_id=$2 ORDER BY d.updated_at DESC LIMIT 1`, [childId, user.familyId]);
+    const result = await query(`SELECT d.id AS "deviceId",d.child_id AS "childId",d.device_name AS "deviceName",d.brand,d.model,d.android_version AS "androidVersion",d.client_version AS "clientVersion",d.battery,COALESCE(d.battery,0) AS "batteryPercent",d.network_type AS "networkType",d.online,CASE WHEN COALESCE(d.online,false) THEN 1 ELSE 0 END AS status,CASE WHEN COALESCE(d.online,false) THEN 1 ELSE 0 END AS "onLineStatus",d.last_heartbeat_at AS "lastHeartbeatAt",d.last_seen_at AS "lastSeenAt",d.permissions,d.metadata,d.step_count AS "stepCount",d.current_app_package AS "currentAppPackage",d.current_app_name AS "currentAppName",d.control_status AS "controlStatus",d.last_location_at AS "lastLocationAt",d.last_usage_sync_at AS "lastUsageAt",d.last_apps_sync_at AS "lastAppsSyncAt" FROM devices d JOIN children c ON c.id=d.child_id WHERE d.child_id=$1 AND c.family_id=$2 ORDER BY d.updated_at DESC LIMIT 1`, [childId, user.familyId]);
     return { data: result.rows[0] ?? null };
   });
 
@@ -624,7 +624,7 @@ export async function registerRoutes(app: FastifyInstance) {
 
   app.get('/api/v1/parent/app/childStatusInfo/:childId', async (request: any) => {
     const user = await getAuthUser(app, request); const childId = request.params.childId;
-    const result = await query(`SELECT c.id AS "childId",d.online,d.battery,d.last_seen_at AS "lastSeenAt",d.client_version AS "clientVersion" FROM children c LEFT JOIN LATERAL (SELECT * FROM devices WHERE child_id=c.id ORDER BY updated_at DESC LIMIT 1) d ON true WHERE c.id=$1 AND c.family_id=$2`, [childId, user.familyId]);
+    const result = await query(`SELECT c.id AS "childId",d.online,CASE WHEN COALESCE(d.online,false) THEN 1 ELSE 0 END AS status,CASE WHEN COALESCE(d.online,false) THEN 1 ELSE 0 END AS "onLineStatus",d.battery,COALESCE(d.battery,0) AS "batteryPercent",d.last_seen_at AS "lastSeenAt",d.client_version AS "clientVersion" FROM children c LEFT JOIN LATERAL (SELECT * FROM devices WHERE child_id=c.id ORDER BY updated_at DESC LIMIT 1) d ON true WHERE c.id=$1 AND c.family_id=$2`, [childId, user.familyId]);
     return { data: result.rows[0] ?? null };
   });
   app.get('/api/v1/parent/app/settings', async (request: any) => {
@@ -795,7 +795,9 @@ export async function registerRoutes(app: FastifyInstance) {
     if(!found.rows[0]) return reply.code(400).send({message:'绑定码无效或已过期'});
     const row=await query<{id:string}>('INSERT INTO devices(child_id,device_token_hash,device_name,brand,model,android_version,client_version,metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb) RETURNING id',[found.rows[0].child_id,hashToken(token),b.deviceName??null,b.brand??null,b.model??null,b.androidVersion??null,b.clientVersion??null,JSON.stringify(b.metadata??{})]);
     await query('UPDATE bind_tokens SET used_at=now() WHERE token=$1',[bindToken]);
-    return {data:{deviceId:row.rows[0].id,deviceToken:token,childId:found.rows[0].child_id}};
+    // The original child APK parses the credential as `data.token` and stores
+    // `data.deviceId`. Keep the newer aliases as well for our own clients.
+    return {code:0,data:{deviceId:row.rows[0].id,token,deviceToken:token,childId:found.rows[0].child_id,childType:0,expires_in:0}};
   });
 
   app.post('/api/v1/device/bind', async (request:any,reply)=>app.inject({method:'POST',url:'/api/v1/device/register',payload:request.body}).then(r=>reply.code(r.statusCode).send(r.json())));
@@ -805,7 +807,7 @@ export async function registerRoutes(app: FastifyInstance) {
   app.post('/api/v1/device/uploadApps', async (request:any,reply)=>{const device=await findDevice(request);if(!device)return reply.code(401).send({message:'device unauthorized'});await handleDeviceMessage(device.id,{type:'apps',payload:request.body??{}});return {data:{ok:true}};});
 
   const childDevice = async (request: any, reply: any) => { const device = await findDevice(request); if (!device) { await reply.code(401).send({ message: 'device unauthorized' }); return null; } return device; };
-  app.post('/api/v1/child/childUser/bindChild', async (request: any, reply: any) => { const b=request.body??{}; const bindToken=String(b.bindToken??b.bindCode??b.code??''); const token=String(b.deviceToken??b.token??randomUUID()); const found=await query<{child_id:string}>('SELECT child_id FROM bind_tokens WHERE token=$1 AND used_at IS NULL AND expires_at>now()',[bindToken]); if(!found.rows[0])return reply.code(400).send({message:'绑定码无效或已过期'}); const row=await query<{id:string}>('INSERT INTO devices(child_id,device_token_hash,device_name,brand,model,android_version,client_version,metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb) RETURNING id',[found.rows[0].child_id,hashToken(token),b.deviceName??null,b.brand??null,b.model??null,b.androidVersion??null,b.clientVersion??null,JSON.stringify(b.metadata??{})]); await query('UPDATE bind_tokens SET used_at=now() WHERE token=$1',[bindToken]); return {data:{deviceId:row.rows[0].id,deviceToken:token,childId:found.rows[0].child_id}}; });
+  app.post('/api/v1/child/childUser/bindChild', async (request: any, reply: any) => { const b=request.body??{}; const bindToken=String(b.bindToken??b.bindCode??b.code??''); const token=String(b.deviceToken??b.token??randomUUID()); const found=await query<{child_id:string}>('SELECT child_id FROM bind_tokens WHERE token=$1 AND used_at IS NULL AND expires_at>now()',[bindToken]); if(!found.rows[0])return reply.code(400).send({message:'绑定码无效或已过期'}); const row=await query<{id:string}>('INSERT INTO devices(child_id,device_token_hash,device_name,brand,model,android_version,client_version,metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb) RETURNING id',[found.rows[0].child_id,hashToken(token),b.deviceName??null,b.brand??null,b.model??null,b.androidVersion??null,b.clientVersion??null,JSON.stringify(b.metadata??{})]); await query('UPDATE bind_tokens SET used_at=now() WHERE token=$1',[bindToken]); return {code:0,data:{deviceId:row.rows[0].id,token,deviceToken:token,childId:found.rows[0].child_id,childType:0,expires_in:0}}; });
   app.get('/api/v1/child/childUser/getChildToken', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; return {data:{deviceId:device.id,childId:device.child_id}}; });
   app.get('/api/v1/child/childUser/getChildInfo', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; const result=await query(`SELECT c.id AS "childId",c.name,c.phone,c.family_id AS "familyId" FROM children c WHERE c.id=$1`,[device.child_id]); return {data:result.rows[0]??null}; });
   app.get('/api/v1/child/childUser/get/:id', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; const result=await query(`SELECT c.id AS "childId",c.name,c.phone,c.avatar_url AS "avatarUrl",c.family_id AS "familyId" FROM children c WHERE c.id=$1 AND c.id=$2`,[device.child_id,request.params.id]); return {data:result.rows[0]??null}; });
@@ -817,7 +819,10 @@ export async function registerRoutes(app: FastifyInstance) {
   app.get('/api/v1/child/childUser/getChildStatus', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; const result=await query(`SELECT online,battery,network_type AS "networkType",last_seen_at AS "lastSeenAt",control_status AS "controlStatus",device_owner_enabled AS "deviceOwnerEnabled",dpm_restrictions AS "dpmRestrictions" FROM devices WHERE id=$1`,[device.id]); return {data:result.rows[0]??null}; });
   app.post('/api/v1/child/childUser/heartBeat', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; await markDevice(device.id,true,{lastHeartbeatAt:new Date().toISOString(),...(request.body??{})}); return {data:{ok:true}}; });
   app.post('/api/v1/child/mobile/uploadDeviceInfo', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; await markDevice(device.id,true,request.body??{}); return {data:{ok:true}}; });
-  app.post('/api/v1/child/mobile/updateBatteryPercent', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; await markDevice(device.id,true,{battery:(request.body??{}).battery ?? (request.body??{}).batteryPercent}); return {data:{ok:true}}; });
+  const updateBatteryPercent = async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; const body=request.body??{}; const queryParams=request.query??{}; const raw=body.battery ?? body.batteryPercent ?? queryParams.battery ?? queryParams.batteryPercent; const battery=Number(raw); await markDevice(device.id,true,{battery:Number.isFinite(battery)?Math.max(0,Math.min(100,battery)):null}); return {data:{ok:true}}; };
+  app.post('/api/v1/child/mobile/updateBatteryPercent', updateBatteryPercent);
+  // The original child APK uses GET with batteryPercent as a query parameter.
+  app.get('/api/v1/child/mobile/updateBatteryPercent', updateBatteryPercent);
   app.get('/api/v1/child/controlPolicy/getControlList', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; const result=await query('SELECT * FROM control_policies WHERE child_id=$1',[device.child_id]); return {data:result.rows}; });
   app.get('/api/v1/child/controlPolicy/getPolicylistByChildId', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; const result=await query('SELECT * FROM control_policies WHERE child_id=$1',[device.child_id]); return {data:result.rows}; });
   app.get('/api/v1/child/controlPolicy/getLocateStatus', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; const result=await query('SELECT location_enabled AS "locationEnabled",automatic_location_enabled AS "automaticLocationEnabled" FROM child_app_settings WHERE child_id=$1',[device.child_id]); return {data:result.rows[0]??{locationEnabled:true,automaticLocationEnabled:true}}; });
@@ -854,9 +859,31 @@ export async function registerRoutes(app: FastifyInstance) {
 
   app.get('/ws', { websocket: true }, (socket: any, request: any) => {
     let deviceId = '';
+    // The vendor child client authenticates the WebSocket with the raw token
+    // in the Authorization header and does not send a hello frame.
+    void (async () => {
+      try {
+        const device = await findDevice(request);
+        if (device) {
+          deviceId = device.id;
+          deviceSockets.set(deviceId, socket);
+          await markDevice(deviceId, true, { lastHeartbeatAt: new Date().toISOString() });
+          await flushQueuedCommands(deviceId);
+        }
+      } catch (error) {
+        request.log.warn({ error }, 'legacy device websocket authentication failed');
+      }
+    })();
     socket.on('message', async (raw: Buffer) => {
       try {
-        const message = JSON.parse(raw.toString()) as DeviceMessage;
+        const text = raw.toString();
+        // The original APK sends the literal Chinese heartbeat string every
+        // ten seconds. Treat it as a heartbeat after header authentication.
+        if (text === '心跳包' || text === 'heartbeat' || text === 'HEARTBEAT') {
+          if (deviceId) await handleDeviceMessage(deviceId, { type: 'heartbeat', payload: {} });
+          return;
+        }
+        const message = JSON.parse(text) as DeviceMessage;
         if (!deviceId && (message.type === 'device_hello' || message.type === 'hello' || message.type === 'register')) {
           const token = String((message.payload ?? {}).token ?? message.payload?.deviceToken ?? message.deviceId ?? '');
           const byId = message.deviceId ? await query<{id:string;device_token_hash:string}>('SELECT id,device_token_hash FROM devices WHERE id=$1',[message.deviceId]) : {rows:[]};
@@ -879,8 +906,11 @@ async function findDevice(request:any) {
   const auth = String(request.headers.authorization ?? ''); const queryParams = request.query ?? {}; const body = request.body ?? {};
   const supplied = auth.replace(/^Bearer\s+/i,'') || String(body.deviceToken ?? body.token ?? queryParams.deviceToken ?? queryParams.token ?? request.headers['x-device-token'] ?? '');
   const deviceId = String(body.deviceId ?? queryParams.deviceId ?? request.headers['x-device-id'] ?? '');
-  if(!supplied || !deviceId) return null;
-  const result=await query<{id:string;child_id:string}>('SELECT d.id,d.child_id FROM devices d JOIN children c ON c.id=d.child_id WHERE d.id=$1 AND d.device_token_hash=$2',[deviceId,hashToken(supplied)]); return result.rows[0]??null;
+  if(!supplied) return null;
+  const result = deviceId
+    ? await query<{id:string;child_id:string}>('SELECT d.id,d.child_id FROM devices d JOIN children c ON c.id=d.child_id WHERE d.id=$1 AND d.device_token_hash=$2',[deviceId,hashToken(supplied)])
+    : await query<{id:string;child_id:string}>('SELECT d.id,d.child_id FROM devices d JOIN children c ON c.id=d.child_id WHERE d.device_token_hash=$1 LIMIT 1',[hashToken(supplied)]);
+  return result.rows[0]??null;
 }
 
 async function dispatchPolicy(familyId:string, childId:string, command:string, payload:Record<string,unknown>) {

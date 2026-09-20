@@ -329,7 +329,25 @@ export async function registerRoutes(app: FastifyInstance) {
     const child = await query<{ id: string }>('INSERT INTO children(family_id,name) VALUES($1,$2) RETURNING id', [familyId, name]);
     await query('INSERT INTO bind_tokens(token,family_id,child_id,expires_at) VALUES($1,$2,$3,now()+interval \'10 minutes\')', [token, familyId, child.rows[0].id]);
     await query('INSERT INTO admin_audit_logs(username,action,family_id,child_id,detail) VALUES($1,$2,$3,$4,$5::jsonb)', [admin.username, 'bind_code_created', familyId, child.rows[0].id, JSON.stringify({ name, expiresIn: 600 })]);
-    return { data: { bindCode: token, childId: child.rows[0].id, content: `guardian://bind?token=${token}`, expiresIn: 600 } };
+    const childId = child.rows[0].id;
+    const url = `guardian://bind?childId=${encodeURIComponent(childId)}`;
+    return { data: { code: token, bindCode: token, childId, url, content: `${url}&code=${token}`, expiresIn: 600, expiresAt: new Date(Date.now() + 600_000).toISOString() } };
+  });
+
+  app.get('/api/v1/admin/bind-codes', async (request: any, reply) => {
+    if (!await requireAdmin(request, reply)) return;
+    const result = await query(`SELECT b.token AS code,b.child_id AS "childId",c.name AS "childName",b.family_id AS "familyId",f.name AS "familyName",b.expires_at AS "expiresAt",b.created_at AS "createdAt" FROM bind_tokens b JOIN families f ON f.id=b.family_id LEFT JOIN children c ON c.id=b.child_id WHERE b.used_at IS NULL AND b.expires_at>now() ORDER BY b.created_at DESC LIMIT 200`);
+    return { data: result.rows };
+  });
+
+  app.delete('/api/v1/admin/bind-codes/:code', async (request: any, reply) => {
+    const admin = await requireAdmin(request, reply); if (!admin) return;
+    const code = String(request.params.code ?? '').trim();
+    if (!/^\d{6}$/.test(code)) return reply.code(400).send({ message: '绑定码必须是 6 位数字' });
+    const removed = await query<{ family_id: string; child_id: string | null }>('DELETE FROM bind_tokens WHERE token=$1 RETURNING family_id,child_id', [code]);
+    if (!removed.rows[0]) return reply.code(404).send({ message: '绑定码不存在、已使用或已过期' });
+    await query('INSERT INTO admin_audit_logs(username,action,family_id,child_id,detail) VALUES($1,$2,$3,$4,$5::jsonb)', [admin.username, 'bind_code_deleted', removed.rows[0].family_id, removed.rows[0].child_id, JSON.stringify({ code })]);
+    return { data: true };
   });
 
   app.get('/api/v1/admin/children/:childId', async (request: any, reply) => {
@@ -722,12 +740,40 @@ export async function registerRoutes(app: FastifyInstance) {
   });
 
   app.get('/api/v1/parent/account/getBindQrcode', async (request: any) => {
-    const user = await getAuthUser(app, request); let token = '';
-    for (let attempt = 0; attempt < 5; attempt += 1) { const candidate = String(Math.floor(100000 + Math.random() * 900000)); const exists = await query('SELECT 1 FROM bind_tokens WHERE token=$1 AND expires_at>now()', [candidate]); if (!exists.rows[0]) { token = candidate; break; } }
-    if (!token) token = String(Math.floor(100000 + Math.random() * 900000));
-    const child = await query<{ id: string }>('INSERT INTO children(family_id,name) VALUES ($1,$2) RETURNING id', [user.familyId, '孩子']);
-    await query(`INSERT INTO bind_tokens(token,family_id,child_id,expires_at) VALUES ($1,$2,$3,now()+interval '10 minutes')`, [token,user.familyId,child.rows[0].id]);
-    return { data: { bindCode: token, childId: child.rows[0].id, content: `guardian://bind?token=${token}`, expiresIn: 600 } };
+    const user = await getAuthUser(app, request);
+    const requestedChildId = String((request.query as any)?.childId ?? '').trim();
+    let childId = requestedChildId;
+    if (childId) {
+      const child = await query<{ id: string }>('SELECT id FROM children WHERE id=$1 AND family_id=$2 AND active=true', [childId, user.familyId]);
+      if (!child.rows[0]) childId = '';
+    }
+
+    // The bind page can request the code twice during its lifecycle. Reuse one
+    // active code so opening the page does not create duplicate children/codes.
+    const active = await query<{ token: string; child_id: string; expires_at: string }>(
+      `SELECT b.token,b.child_id,b.expires_at FROM bind_tokens b JOIN children c ON c.id=b.child_id WHERE b.family_id=$1 AND b.used_at IS NULL AND b.expires_at>now() AND ($2='' OR b.child_id=$2) ORDER BY b.created_at DESC LIMIT 1`,
+      [user.familyId, childId]
+    );
+    let token = active.rows[0]?.token ?? '';
+    let expiresAt = active.rows[0]?.expires_at ?? '';
+    if (active.rows[0]) childId = active.rows[0].child_id;
+    if (!token) {
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        const candidate = String(Math.floor(100000 + Math.random() * 900000));
+        const exists = await query('SELECT 1 FROM bind_tokens WHERE token=$1 AND expires_at>now()', [candidate]);
+        if (!exists.rows[0]) { token = candidate; break; }
+      }
+      if (!token) throw new Error('暂时无法生成绑定码，请重试');
+      if (!childId) {
+        const child = await query<{ id: string }>('INSERT INTO children(family_id,name) VALUES ($1,$2) RETURNING id', [user.familyId, '孩子']);
+        childId = child.rows[0].id;
+      }
+      const created = await query<{ expires_at: string }>(`INSERT INTO bind_tokens(token,family_id,child_id,expires_at) VALUES ($1,$2,$3,now()+interval '10 minutes') RETURNING expires_at`, [token,user.familyId,childId]);
+      expiresAt = created.rows[0].expires_at;
+    }
+    const url = `guardian://bind?childId=${encodeURIComponent(childId)}`;
+    const remaining = Math.max(1, Math.ceil((new Date(expiresAt).getTime() - Date.now()) / 1000));
+    return { data: { code: token, bindCode: token, childId, url, content: `${url}&code=${token}`, expiresIn: remaining, expiresAt } };
   });
 
   const removeDevice = async (request: any) => { const user = await getAuthUser(app, request); const b=request.body??{}; const childId=String(b.childId ?? (request.query as any)?.childId ?? ''); await query(`DELETE FROM devices d USING children c WHERE d.child_id=$1 AND c.id=d.child_id AND c.family_id=$2`,[childId,user.familyId]); return {data:true}; };

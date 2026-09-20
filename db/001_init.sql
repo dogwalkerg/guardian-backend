@@ -169,6 +169,15 @@ CREATE TABLE IF NOT EXISTS captcha_codes (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS parent_active_codes (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  code VARCHAR(80) UNIQUE NOT NULL,
+  days INTEGER NOT NULL DEFAULT 30,
+  used_by UUID REFERENCES users(id) ON DELETE SET NULL,
+  used_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS bind_tokens (
   token VARCHAR(128) PRIMARY KEY,
   family_id UUID NOT NULL REFERENCES families(id) ON DELETE CASCADE,
@@ -188,6 +197,11 @@ ALTER TABLE devices ADD COLUMN IF NOT EXISTS control_status VARCHAR(32) NOT NULL
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS last_location_at TIMESTAMPTZ;
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS last_usage_sync_at TIMESTAMPTZ;
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS last_apps_sync_at TIMESTAMPTZ;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS device_owner_enabled BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS device_owner_package VARCHAR(255);
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS dpm_api_level INTEGER;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS dpm_restrictions JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS dpm_last_sync_at TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS child_app_settings (
   child_id UUID PRIMARY KEY REFERENCES children(id) ON DELETE CASCADE,
@@ -196,8 +210,39 @@ CREATE TABLE IF NOT EXISTS child_app_settings (
   location_enabled BOOLEAN NOT NULL DEFAULT true,
   automatic_location_enabled BOOLEAN NOT NULL DEFAULT true,
   hotspot_enabled BOOLEAN NOT NULL DEFAULT true,
+  show_app_management BOOLEAN NOT NULL DEFAULT true,
+  reset_disabled BOOLEAN NOT NULL DEFAULT false,
+  allow_call BOOLEAN NOT NULL DEFAULT true,
+  allow_wechat BOOLEAN NOT NULL DEFAULT true,
+  allow_qq BOOLEAN NOT NULL DEFAULT true,
+  allow_phone BOOLEAN NOT NULL DEFAULT true,
+  offline_lock_after_days INTEGER,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE child_app_settings ADD COLUMN IF NOT EXISTS show_app_management BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE child_app_settings ADD COLUMN IF NOT EXISTS reset_disabled BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE child_app_settings ADD COLUMN IF NOT EXISTS allow_call BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE child_app_settings ADD COLUMN IF NOT EXISTS allow_wechat BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE child_app_settings ADD COLUMN IF NOT EXISTS allow_qq BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE child_app_settings ADD COLUMN IF NOT EXISTS allow_phone BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE child_app_settings ADD COLUMN IF NOT EXISTS offline_lock_after_days INTEGER;
+
+CREATE TABLE IF NOT EXISTS control_periods (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  child_id UUID NOT NULL REFERENCES children(id) ON DELETE CASCADE,
+  name VARCHAR(120) NOT NULL,
+  weekdays SMALLINT[] NOT NULL DEFAULT '{1,2,3,4,5,6,7}',
+  start_time TIME NOT NULL,
+  end_time TIME NOT NULL,
+  mode VARCHAR(32) NOT NULL DEFAULT 'allow',
+  daily_limit_seconds INTEGER,
+  allowed_packages JSONB NOT NULL DEFAULT '[]'::jsonb,
+  priority INTEGER NOT NULL DEFAULT 100,
+  enabled BOOLEAN NOT NULL DEFAULT true,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_control_periods_child ON control_periods(child_id, enabled, priority);
 
 CREATE TABLE IF NOT EXISTS step_records (
   id BIGSERIAL PRIMARY KEY,

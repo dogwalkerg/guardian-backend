@@ -32,6 +32,12 @@ curl http://127.0.0.1:18080/health
 
 API 通过宝塔反向代理到 `http://127.0.0.1:18080`，WebSocket 路径为 `/ws`。
 
+## Device Owner / DPM 子端接入边界
+
+云端命令队列支持 `DEVICE_OWNER_POLICY_UPDATE`、`CONTROL_PERIODS_UPDATE`、`APP_FUNCTION_POLICY_UPDATE` 等控制消息，并接收孩子端的 `device_owner_status`/`dpm_status` 回执。孩子端必须在 Android 设备上实际实现 `DeviceAdminReceiver` 和 `DevicePolicyManager`，将 `no_config_tethering`、`no_config_location`、`no_factory_reset`、设置菜单隐藏等限制应用到本机后，再上报限制状态。WebSocket 的命令状态 `sent` 只表示已发送，`succeeded` 需要孩子端回执才能成立。
+
+普通 APK 不能被云端直接授予 Device Owner。首次部署必须通过 Android 出厂 provisioning、企业零接触/QR provisioning 或受控 ADB 完成授权；只有具备匹配签名和 `DeviceAdminReceiver` 的孩子端源码才能重新打包。当前仓库不包含两个 APK 的 Android 源码，因此本仓库的云端升级不会伪造或绕过系统授权，也不会保证未改造的旧 APK 执行新的 DPM 命令。
+
 ## 管理员控制台和一键更新
 
 管理员控制台地址为 `/admin/`，使用 `ADMIN_USERNAME` 与 `ADMIN_PASSWORD_HASH` 登录。生产环境不要使用明文 `ADMIN_PASSWORD`，可使用 `node -e "console.log(require('bcryptjs').hashSync('your-password', 10))"` 生成 bcrypt 哈希。

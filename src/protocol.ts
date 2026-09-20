@@ -28,3 +28,32 @@ export type DeviceMessage = {
   status?: string;
   result?: Record<string, any>;
 };
+
+/**
+ * Contract for a child Android client using DevicePolicyManager. The cloud
+ * queues these commands, but only the provisioned Device Owner can apply the
+ * restrictions on-device and must report a `device_owner_status` event.
+ */
+export type DeviceOwnerPolicy = {
+  deviceOwnerRequired?: boolean;
+  restrictions?: {
+    noConfigTethering?: boolean;
+    noConfigLocation?: boolean;
+    noFactoryReset?: boolean;
+    removeSettingsMenus?: boolean;
+    allowAppManagement?: boolean;
+  };
+  applicationPolicies?: Array<{
+    packageName: string;
+    policyType: 1 | 2 | 3;
+    dailyLimitSeconds?: number | null;
+  }>;
+  periods?: Array<{
+    weekdays: number[];
+    startTime: string;
+    endTime: string;
+    mode: 'allow' | 'forbid' | 'lock';
+    allowedPackages?: string[];
+  }>;
+  offline?: { mode: 'allow' | 'deny'; lockAfterDays?: number | null };
+};

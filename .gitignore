@@ -7,3 +7,4 @@ dist/
 uploads/*
 !uploads/.gitkeep
 *.log
+/.guardian-*.tar.gz

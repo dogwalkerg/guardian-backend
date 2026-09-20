@@ -330,8 +330,8 @@ export async function registerRoutes(app: FastifyInstance) {
     await query('INSERT INTO bind_tokens(token,family_id,child_id,expires_at) VALUES($1,$2,$3,now()+interval \'10 minutes\')', [token, familyId, child.rows[0].id]);
     await query('INSERT INTO admin_audit_logs(username,action,family_id,child_id,detail) VALUES($1,$2,$3,$4,$5::jsonb)', [admin.username, 'bind_code_created', familyId, child.rows[0].id, JSON.stringify({ name, expiresIn: 600 })]);
     const childId = child.rows[0].id;
-    const url = `guardian://bind?childId=${encodeURIComponent(childId)}`;
-    return { data: { code: token, bindCode: token, childId, url, content: `${url}&code=${token}`, expiresIn: 600, expiresAt: new Date(Date.now() + 600_000).toISOString() } };
+    const url = `guardian://bind?childId=${encodeURIComponent(childId)}&code=${token}`;
+    return { code: 0, data: { code: token, bindCode: token, childId, url, content: url, expiresIn: 600, expiresAt: new Date(Date.now() + 600_000).toISOString() } };
   });
 
   app.get('/api/v1/admin/bind-codes', async (request: any, reply) => {
@@ -771,9 +771,9 @@ export async function registerRoutes(app: FastifyInstance) {
       const created = await query<{ expires_at: string }>(`INSERT INTO bind_tokens(token,family_id,child_id,expires_at) VALUES ($1,$2,$3,now()+interval '10 minutes') RETURNING expires_at`, [token,user.familyId,childId]);
       expiresAt = created.rows[0].expires_at;
     }
-    const url = `guardian://bind?childId=${encodeURIComponent(childId)}`;
+    const url = `guardian://bind?childId=${encodeURIComponent(childId)}&code=${token}`;
     const remaining = Math.max(1, Math.ceil((new Date(expiresAt).getTime() - Date.now()) / 1000));
-    return { data: { code: token, bindCode: token, childId, url, content: `${url}&code=${token}`, expiresIn: remaining, expiresAt } };
+    return { code: 0, data: { code: token, bindCode: token, childId, url, content: url, expiresIn: remaining, expiresAt } };
   });
 
   const removeDevice = async (request: any) => { const user = await getAuthUser(app, request); const b=request.body??{}; const childId=String(b.childId ?? (request.query as any)?.childId ?? ''); await query(`DELETE FROM devices d USING children c WHERE d.child_id=$1 AND c.id=d.child_id AND c.family_id=$2`,[childId,user.familyId]); return {data:true}; };

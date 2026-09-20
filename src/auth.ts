@@ -44,26 +44,36 @@ export function hashToken(value: string) {
 }
 
 export async function ensureUserAndFamily(phone: string, displayName?: string) {
-  return (await query<{ id: string; phone: string; family_id: string }>(
-    `WITH new_user AS (
-       INSERT INTO users(phone, display_name) VALUES ($1, $2)
-       ON CONFLICT(phone) DO UPDATE SET updated_at = now()
-       RETURNING id, phone
-     ), family AS (
-       INSERT INTO families(owner_user_id) SELECT id FROM new_user
-       WHERE NOT EXISTS (SELECT 1 FROM families f WHERE f.owner_user_id = new_user.id)
-       RETURNING id, owner_user_id
-     ), membership AS (
-       INSERT INTO family_members(family_id, user_id, role)
-       SELECT f.id, u.id, 'owner' FROM users u
-       JOIN families f ON f.owner_user_id = u.id
-       WHERE u.phone = $1
-       ON CONFLICT DO NOTHING
-     )
-     SELECT u.id, u.phone, f.id AS family_id
-     FROM users u JOIN families f ON f.owner_user_id = u.id WHERE u.phone = $1`,
+  // Keep these operations sequential. A data-modifying CTE cannot reliably
+  // read rows inserted by a sibling CTE in the same statement snapshot, which
+  // made the first login write records but return an undefined family.
+  const userResult = await query<{ id: string; phone: string }>(
+    `INSERT INTO users(phone, display_name) VALUES ($1, $2)
+     ON CONFLICT(phone) DO UPDATE SET updated_at = now()
+     RETURNING id, phone`,
     [phone, displayName ?? `家长${phone.slice(-4)}`]
-  )).rows[0];
+  );
+  const user = userResult.rows[0];
+  if (!user) throw new Error('无法创建家长账号');
+
+  let familyResult = await query<{ id: string }>(
+    'SELECT id FROM families WHERE owner_user_id=$1 ORDER BY created_at LIMIT 1',
+    [user.id]
+  );
+  if (!familyResult.rows[0]) {
+    familyResult = await query<{ id: string }>(
+      'INSERT INTO families(owner_user_id) VALUES ($1) RETURNING id',
+      [user.id]
+    );
+  }
+  const family = familyResult.rows[0];
+  if (!family) throw new Error('无法创建家庭');
+  await query(
+    `INSERT INTO family_members(family_id, user_id, role)
+     VALUES ($1, $2, 'owner') ON CONFLICT DO NOTHING`,
+    [family.id, user.id]
+  );
+  return { id: user.id, phone: user.phone, family_id: family.id };
 }
 
 export async function verifyCaptcha(phone: string, code: string, fixedAllowed: boolean, fixedCode: string) {

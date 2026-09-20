@@ -435,6 +435,7 @@ export async function registerRoutes(app: FastifyInstance) {
     const childId = String(request.params.childId); const b = request.body ?? {};
     const child = await adminChild(childId); if (!child) return reply.code(404).send({ message: '孩子不存在' });
     await query(`INSERT INTO control_policies(child_id,name,enabled,no_play_enabled,lock_enabled,allow_call,emergency_numbers,periods,daily_limit_seconds,timezone) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9,$10) ON CONFLICT(child_id) DO UPDATE SET name=EXCLUDED.name,enabled=EXCLUDED.enabled,no_play_enabled=EXCLUDED.no_play_enabled,lock_enabled=EXCLUDED.lock_enabled,allow_call=EXCLUDED.allow_call,emergency_numbers=EXCLUDED.emergency_numbers,periods=EXCLUDED.periods,daily_limit_seconds=EXCLUDED.daily_limit_seconds,timezone=EXCLUDED.timezone,updated_at=now()`, [childId, b.name ?? '默认管控策略', b.enabled ?? true, b.noPlayEnabled ?? false, b.lockEnabled ?? false, b.allowCall ?? true, JSON.stringify(b.emergencyNumbers ?? []), JSON.stringify(b.periods ?? []), b.dailyLimitSeconds ?? null, b.timezone ?? 'Asia/Shanghai']);
+    await replaceControlPeriods(childId, b.periods);
     const command = await dispatchAdminCommand(childId, COMMANDS.policyUpdate, b, admin.username);
     return { data: { saved: true, command } };
   });
@@ -466,11 +467,7 @@ export async function registerRoutes(app: FastifyInstance) {
     const admin = await requireAdmin(request, reply); if (!admin) return;
     const childId = String(request.params.childId); const items = Array.isArray((request.body ?? {}).items) ? (request.body as any).items : [];
     if (!await adminChild(childId)) return reply.code(404).send({ message: '孩子不存在' });
-    await query('DELETE FROM control_periods WHERE child_id=$1', [childId]);
-    for (const item of items) {
-      if (!item.name || !item.startTime || !item.endTime) continue;
-      await query(`INSERT INTO control_periods(child_id,name,weekdays,start_time,end_time,mode,daily_limit_seconds,allowed_packages,priority,enabled) VALUES ($1,$2,$3::smallint[],$4,$5,$6,$7,$8::jsonb,$9,$10)`, [childId, item.name, item.weekdays ?? [1,2,3,4,5,6,7], item.startTime, item.endTime, item.mode ?? 'allow', item.dailyLimitSeconds ?? null, JSON.stringify(item.allowedPackages ?? []), item.priority ?? 100, item.enabled ?? true]);
-    }
+    await replaceControlPeriods(childId, items);
     const command = await dispatchAdminCommand(childId, COMMANDS.periodsUpdate, { items }, admin.username);
     return { data: { saved: true, command } };
   });
@@ -659,6 +656,7 @@ export async function registerRoutes(app: FastifyInstance) {
     const childId = b.childId; if (!childId) return { error: 'childId is required' };
     const child = await query('SELECT id FROM children WHERE id=$1 AND family_id=$2 AND active=true', [childId, user.familyId]); if (!child.rows[0]) return { error: 'child not found' };
     await query(`INSERT INTO control_policies(child_id,name,enabled,no_play_enabled,lock_enabled,allow_call,emergency_numbers,periods,daily_limit_seconds,timezone) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9,$10) ON CONFLICT(child_id) DO UPDATE SET name=EXCLUDED.name,enabled=EXCLUDED.enabled,no_play_enabled=EXCLUDED.no_play_enabled,lock_enabled=EXCLUDED.lock_enabled,allow_call=EXCLUDED.allow_call,emergency_numbers=EXCLUDED.emergency_numbers,periods=EXCLUDED.periods,daily_limit_seconds=EXCLUDED.daily_limit_seconds,timezone=EXCLUDED.timezone,updated_at=now()`, [childId,b.name ?? '默认管控策略',b.enabled ?? true,b.noPlayEnabled ?? b.no_play_enabled ?? false,b.lockEnabled ?? b.lock_enabled ?? false,b.allowCall ?? true,JSON.stringify(b.emergencyNumbers ?? []),JSON.stringify(b.periods ?? []),b.dailyLimitSeconds ?? null,b.timezone ?? 'Asia/Shanghai']);
+    await replaceControlPeriods(String(childId), b.periods);
     await dispatchPolicy(user.familyId, String(childId), 'policy_update', b); return { data: true };
   });
   app.delete('/api/v1/parent/controlPolicy/removeControlPolicy', async (request: any) => {
@@ -672,8 +670,7 @@ export async function registerRoutes(app: FastifyInstance) {
   });
   app.put('/api/v1/parent/controlPolicy/periods', async (request: any) => {
     const user = await getAuthUser(app, request); const b = request.body ?? {}; const childId = String(b.childId ?? ''); const items = Array.isArray(b.items) ? b.items : [];
-    await query('DELETE FROM control_periods p USING children c WHERE p.child_id=$1 AND c.id=p.child_id AND c.family_id=$2', [childId, user.familyId]);
-    for (const item of items) if (item.name && item.startTime && item.endTime) await query(`INSERT INTO control_periods(child_id,name,weekdays,start_time,end_time,mode,daily_limit_seconds,allowed_packages,priority,enabled) VALUES ($1,$2,$3::smallint[],$4,$5,$6,$7,$8::jsonb,$9,$10)`, [childId,item.name,item.weekdays ?? [1,2,3,4,5,6,7],item.startTime,item.endTime,item.mode ?? 'allow',item.dailyLimitSeconds ?? null,JSON.stringify(item.allowedPackages ?? []),item.priority ?? 100,item.enabled ?? true]);
+    await replaceControlPeriods(childId, items);
     await dispatchPolicy(user.familyId, childId, 'periods_update', { items }); return { data: true };
   });
 
@@ -795,5 +792,15 @@ async function dispatchPolicy(familyId:string, childId:string, command:string, p
   const sent = online && broadcastToDevice(device.rows[0].id, { type: 'command', messageId: id, command: WIRE_COMMANDS[command] ?? command, payload });
   if (sent) await query(`UPDATE commands SET status='sent',attempts=1,sent_at=now(),updated_at=now() WHERE id=$1`, [id]);
   return id;
+}
+
+async function replaceControlPeriods(childId: string, items: unknown) {
+  if (!Array.isArray(items)) return;
+  await query('DELETE FROM control_periods WHERE child_id=$1', [childId]);
+  for (const raw of items) {
+    const item = raw as Record<string, any>;
+    if (!item.name || !(item.startTime ?? item.start_time) || !(item.endTime ?? item.end_time)) continue;
+    await query(`INSERT INTO control_periods(child_id,name,weekdays,start_time,end_time,mode,daily_limit_seconds,allowed_packages,priority,enabled) VALUES ($1,$2,$3::smallint[],$4,$5,$6,$7,$8::jsonb,$9,$10)`, [childId, item.name, item.weekdays ?? [1,2,3,4,5,6,7], item.startTime ?? item.start_time, item.endTime ?? item.end_time, item.mode ?? 'allow', item.dailyLimitSeconds ?? item.daily_limit_seconds ?? null, JSON.stringify(item.allowedPackages ?? item.allowed_packages ?? []), item.priority ?? 100, item.enabled ?? true]);
+  }
 }
 

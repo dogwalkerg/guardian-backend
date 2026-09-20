@@ -750,10 +750,15 @@ export async function registerRoutes(app: FastifyInstance) {
 
     // The bind page can request the code twice during its lifecycle. Reuse one
     // active code so opening the page does not create duplicate children/codes.
-    const active = await query<{ token: string; child_id: string; expires_at: string }>(
-      `SELECT b.token,b.child_id,b.expires_at FROM bind_tokens b JOIN children c ON c.id=b.child_id WHERE b.family_id=$1 AND b.used_at IS NULL AND b.expires_at>now() AND ($2='' OR b.child_id=$2) ORDER BY b.created_at DESC LIMIT 1`,
-      [user.familyId, childId]
-    );
+    const active = childId
+      ? await query<{ token: string; child_id: string; expires_at: string }>(
+        `SELECT b.token,b.child_id,b.expires_at FROM bind_tokens b JOIN children c ON c.id=b.child_id WHERE b.family_id=$1 AND b.used_at IS NULL AND b.expires_at>now() AND b.child_id=$2::uuid ORDER BY b.created_at DESC LIMIT 1`,
+        [user.familyId, childId]
+      )
+      : await query<{ token: string; child_id: string; expires_at: string }>(
+        `SELECT b.token,b.child_id,b.expires_at FROM bind_tokens b JOIN children c ON c.id=b.child_id WHERE b.family_id=$1 AND b.used_at IS NULL AND b.expires_at>now() ORDER BY b.created_at DESC LIMIT 1`,
+        [user.familyId]
+      );
     let token = active.rows[0]?.token ?? '';
     let expiresAt = active.rows[0]?.expires_at ?? '';
     if (active.rows[0]) childId = active.rows[0].child_id;

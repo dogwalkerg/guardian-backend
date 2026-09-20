@@ -101,12 +101,15 @@ CREATE TABLE IF NOT EXISTS control_policies (
   lock_enabled BOOLEAN NOT NULL DEFAULT false,
   allow_call BOOLEAN NOT NULL DEFAULT true,
   emergency_numbers JSONB NOT NULL DEFAULT '[]'::jsonb,
+  no_play_allowed_packages JSONB NOT NULL DEFAULT '[]'::jsonb,
   periods JSONB NOT NULL DEFAULT '[]'::jsonb,
   daily_limit_seconds INTEGER,
   timezone VARCHAR(64) NOT NULL DEFAULT 'Asia/Shanghai',
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE(child_id)
 );
+
+ALTER TABLE control_policies ADD COLUMN IF NOT EXISTS no_play_allowed_packages JSONB NOT NULL DEFAULT '[]'::jsonb;
 
 CREATE TABLE IF NOT EXISTS usage_records (
   id BIGSERIAL PRIMARY KEY,

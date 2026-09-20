@@ -1,6 +1,6 @@
 {
   "name": "guardian-backend",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "private": true,
   "type": "module",
   "description": "Cloud backend for Guardian parent and child Android applications",

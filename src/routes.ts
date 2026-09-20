@@ -314,6 +314,24 @@ export async function registerRoutes(app: FastifyInstance) {
     return { data: result.rows[0] };
   });
 
+  app.post('/api/v1/admin/families/:familyId/bind-code', async (request: any, reply) => {
+    const admin = await requireAdmin(request, reply); if (!admin) return;
+    const familyId = String(request.params.familyId); const name = String((request.body ?? {}).name ?? '孩子').trim() || '孩子';
+    const family = await query<{ id: string }>('SELECT id FROM families WHERE id=$1', [familyId]);
+    if (!family.rows[0]) return reply.code(404).send({ message: '家庭不存在' });
+    let token = '';
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const candidate = String(Math.floor(100000 + Math.random() * 900000));
+      const exists = await query('SELECT 1 FROM bind_tokens WHERE token=$1 AND expires_at>now()', [candidate]);
+      if (!exists.rows[0]) { token = candidate; break; }
+    }
+    if (!token) return reply.code(503).send({ message: '暂时无法生成绑定码，请重试' });
+    const child = await query<{ id: string }>('INSERT INTO children(family_id,name) VALUES($1,$2) RETURNING id', [familyId, name]);
+    await query('INSERT INTO bind_tokens(token,family_id,child_id,expires_at) VALUES($1,$2,$3,now()+interval \'10 minutes\')', [token, familyId, child.rows[0].id]);
+    await query('INSERT INTO admin_audit_logs(username,action,family_id,child_id,detail) VALUES($1,$2,$3,$4,$5::jsonb)', [admin.username, 'bind_code_created', familyId, child.rows[0].id, JSON.stringify({ name, expiresIn: 600 })]);
+    return { data: { bindCode: token, childId: child.rows[0].id, content: `guardian://bind?token=${token}`, expiresIn: 600 } };
+  });
+
   app.get('/api/v1/admin/children/:childId', async (request: any, reply) => {
     if (!await requireAdmin(request, reply)) return;
     const child = await query(`SELECT c.id AS "childId",c.name,c.phone,c.active,f.id AS "familyId",f.name AS "familyName",u.phone AS "parentPhone",d.id AS "deviceId",d.device_name,d.brand,d.model,d.android_version,d.client_version,d.battery,d.network_type,d.online,d.last_heartbeat_at,d.last_seen_at,d.permissions,d.metadata,d.step_count,d.current_app_package,d.current_app_name,d.current_app_started_at,d.control_status,d.last_location_at,d.last_usage_sync_at,d.last_apps_sync_at,d.device_owner_enabled AS "deviceOwnerEnabled",d.device_owner_package AS "deviceOwnerPackage",d.dpm_api_level AS "dpmApiLevel",d.dpm_restrictions AS "dpmRestrictions",d.dpm_last_sync_at AS "dpmLastSyncAt" FROM children c JOIN families f ON f.id=c.family_id JOIN users u ON u.id=f.owner_user_id LEFT JOIN LATERAL (SELECT * FROM devices WHERE child_id=c.id ORDER BY updated_at DESC LIMIT 1) d ON true WHERE c.id=$1`, [request.params.childId]);
@@ -434,7 +452,7 @@ export async function registerRoutes(app: FastifyInstance) {
     const admin = await requireAdmin(request, reply); if (!admin) return;
     const childId = String(request.params.childId); const b = request.body ?? {};
     const child = await adminChild(childId); if (!child) return reply.code(404).send({ message: '孩子不存在' });
-    await query(`INSERT INTO control_policies(child_id,name,enabled,no_play_enabled,lock_enabled,allow_call,emergency_numbers,periods,daily_limit_seconds,timezone) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9,$10) ON CONFLICT(child_id) DO UPDATE SET name=EXCLUDED.name,enabled=EXCLUDED.enabled,no_play_enabled=EXCLUDED.no_play_enabled,lock_enabled=EXCLUDED.lock_enabled,allow_call=EXCLUDED.allow_call,emergency_numbers=EXCLUDED.emergency_numbers,periods=EXCLUDED.periods,daily_limit_seconds=EXCLUDED.daily_limit_seconds,timezone=EXCLUDED.timezone,updated_at=now()`, [childId, b.name ?? '默认管控策略', b.enabled ?? true, b.noPlayEnabled ?? false, b.lockEnabled ?? false, b.allowCall ?? true, JSON.stringify(b.emergencyNumbers ?? []), JSON.stringify(b.periods ?? []), b.dailyLimitSeconds ?? null, b.timezone ?? 'Asia/Shanghai']);
+    await query(`INSERT INTO control_policies(child_id,name,enabled,no_play_enabled,lock_enabled,allow_call,emergency_numbers,no_play_allowed_packages,periods,daily_limit_seconds,timezone) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9::jsonb,$10,$11) ON CONFLICT(child_id) DO UPDATE SET name=EXCLUDED.name,enabled=EXCLUDED.enabled,no_play_enabled=EXCLUDED.no_play_enabled,lock_enabled=EXCLUDED.lock_enabled,allow_call=EXCLUDED.allow_call,emergency_numbers=EXCLUDED.emergency_numbers,no_play_allowed_packages=EXCLUDED.no_play_allowed_packages,periods=EXCLUDED.periods,daily_limit_seconds=EXCLUDED.daily_limit_seconds,timezone=EXCLUDED.timezone,updated_at=now()`, [childId, b.name ?? '默认管控策略', b.enabled ?? true, b.noPlayEnabled ?? false, b.lockEnabled ?? false, b.allowCall ?? true, JSON.stringify(b.emergencyNumbers ?? []), JSON.stringify(b.noPlayAllowedPackages ?? []), JSON.stringify(b.periods ?? []), b.dailyLimitSeconds ?? null, b.timezone ?? 'Asia/Shanghai']);
     await replaceControlPeriods(childId, b.periods);
     const command = await dispatchAdminCommand(childId, COMMANDS.policyUpdate, b, admin.username);
     return { data: { saved: true, command } };
@@ -682,7 +700,7 @@ export async function registerRoutes(app: FastifyInstance) {
     const user = await getAuthUser(app, request); const b = request.body ?? {};
     const childId = b.childId; if (!childId) return { error: 'childId is required' };
     const child = await query('SELECT id FROM children WHERE id=$1 AND family_id=$2 AND active=true', [childId, user.familyId]); if (!child.rows[0]) return { error: 'child not found' };
-    await query(`INSERT INTO control_policies(child_id,name,enabled,no_play_enabled,lock_enabled,allow_call,emergency_numbers,periods,daily_limit_seconds,timezone) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9,$10) ON CONFLICT(child_id) DO UPDATE SET name=EXCLUDED.name,enabled=EXCLUDED.enabled,no_play_enabled=EXCLUDED.no_play_enabled,lock_enabled=EXCLUDED.lock_enabled,allow_call=EXCLUDED.allow_call,emergency_numbers=EXCLUDED.emergency_numbers,periods=EXCLUDED.periods,daily_limit_seconds=EXCLUDED.daily_limit_seconds,timezone=EXCLUDED.timezone,updated_at=now()`, [childId,b.name ?? '默认管控策略',b.enabled ?? true,b.noPlayEnabled ?? b.no_play_enabled ?? false,b.lockEnabled ?? b.lock_enabled ?? false,b.allowCall ?? true,JSON.stringify(b.emergencyNumbers ?? []),JSON.stringify(b.periods ?? []),b.dailyLimitSeconds ?? null,b.timezone ?? 'Asia/Shanghai']);
+    await query(`INSERT INTO control_policies(child_id,name,enabled,no_play_enabled,lock_enabled,allow_call,emergency_numbers,no_play_allowed_packages,periods,daily_limit_seconds,timezone) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9::jsonb,$10,$11) ON CONFLICT(child_id) DO UPDATE SET name=EXCLUDED.name,enabled=EXCLUDED.enabled,no_play_enabled=EXCLUDED.no_play_enabled,lock_enabled=EXCLUDED.lock_enabled,allow_call=EXCLUDED.allow_call,emergency_numbers=EXCLUDED.emergency_numbers,no_play_allowed_packages=EXCLUDED.no_play_allowed_packages,periods=EXCLUDED.periods,daily_limit_seconds=EXCLUDED.daily_limit_seconds,timezone=EXCLUDED.timezone,updated_at=now()`, [childId,b.name ?? '默认管控策略',b.enabled ?? true,b.noPlayEnabled ?? b.no_play_enabled ?? false,b.lockEnabled ?? b.lock_enabled ?? false,b.allowCall ?? true,JSON.stringify(b.emergencyNumbers ?? []),JSON.stringify(b.noPlayAllowedPackages ?? b.no_play_allowed_packages ?? []),JSON.stringify(b.periods ?? []),b.dailyLimitSeconds ?? null,b.timezone ?? 'Asia/Shanghai']);
     await replaceControlPeriods(String(childId), b.periods);
     await dispatchPolicy(user.familyId, String(childId), 'policy_update', b); return { data: true };
   });

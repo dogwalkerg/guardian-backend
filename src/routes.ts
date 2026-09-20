@@ -564,6 +564,12 @@ export async function registerRoutes(app: FastifyInstance) {
     const result = await query(`SELECT u.id AS "userId",u.phone,u.display_name AS "displayName",fm.role,fm.created_at AS "createdAt" FROM family_members fm JOIN users u ON u.id=fm.user_id WHERE fm.family_id=$1 ORDER BY fm.created_at`, [user.familyId]);
     return { data: result.rows };
   });
+  app.get('/api/v1/parent/family/parentUser/:userId', async (request: any, reply: any) => {
+    const user = await getAuthUser(app, request);
+    const result = await query(`SELECT u.id AS "userId",u.phone,u.display_name AS "displayName",fm.role,fm.created_at AS "createdAt" FROM family_members fm JOIN users u ON u.id=fm.user_id WHERE fm.family_id=$1 AND u.id=$2`, [user.familyId, request.params.userId]);
+    if (!result.rows[0]) return reply.code(404).send({ message: '家庭成员不存在' });
+    return { data: result.rows[0] };
+  });
   app.post('/api/v1/parent/family/parentUser', async (request: any) => {
     const user = await getAuthUser(app, request); const b = request.body ?? {}; const phone = String(b.phone ?? '').trim();
     if (!phone) return { error: 'phone is required' };
@@ -621,6 +627,11 @@ export async function registerRoutes(app: FastifyInstance) {
     const result = await query(`SELECT a.package_name AS "packageName",a.app_name AS "appName",COALESCE(p.policy_type,1) AS type,COALESCE(p.daily_limit_seconds,0) AS "useTime" FROM installed_apps a JOIN devices d ON d.id=a.device_id JOIN children c ON c.id=d.child_id LEFT JOIN app_policies p ON p.child_id=c.id AND p.package_name=a.package_name WHERE c.id=$1 AND c.family_id=$2 ORDER BY a.app_name`, [childId, user.familyId]);
     return { data: result.rows };
   });
+  app.get('/api/v1/parent/childAppSource/childAppSourceList', async (request: any) => {
+    const user = await getAuthUser(app, request); const childId = String((request.query as any)?.childId ?? '');
+    const result = await query(`SELECT a.package_name AS "packageName",a.app_name AS "appName",a.version_name AS "versionName",a.version_code AS "versionCode",a.icon_url AS "iconUrl",a.is_system AS "isSystem",a.last_seen_at AS "lastSeenAt",COALESCE(p.policy_type,1) AS type,COALESCE(p.daily_limit_seconds,0) AS "useTime" FROM installed_apps a JOIN devices d ON d.id=a.device_id JOIN children c ON c.id=d.child_id LEFT JOIN app_policies p ON p.child_id=c.id AND p.package_name=a.package_name WHERE c.id=$1 AND c.family_id=$2 ORDER BY a.app_name`, [childId, user.familyId]);
+    return { data: result.rows };
+  });
 
   app.put('/api/v1/parent/app/control', async (request: any) => {
     const user = await getAuthUser(app, request); const items = Array.isArray(request.body) ? request.body : (request.body ?? {}).items ?? [];
@@ -636,13 +647,29 @@ export async function registerRoutes(app: FastifyInstance) {
   });
   app.get('/api/v1/parent/app/appFunctionControl', async (request: any) => {
     const user = await getAuthUser(app, request); const childId = String((request.query as any)?.childId ?? '');
-    const result = await query('SELECT allow_call AS "allowCall",allow_wechat AS "allowWechat",allow_qq AS "allowQq",allow_phone AS "allowPhone" FROM child_app_settings s JOIN children c ON c.id=s.child_id WHERE s.child_id=$1 AND c.family_id=$2', [childId, user.familyId]);
-    return { data: result.rows[0] ?? null };
+    const result = await query('SELECT allow_call,allow_wechat,allow_qq,allow_phone FROM child_app_settings s JOIN children c ON c.id=s.child_id WHERE s.child_id=$1 AND c.family_id=$2', [childId, user.familyId]);
+    const settings = result.rows[0] ?? { allow_call: true, allow_wechat: true, allow_qq: true, allow_phone: true };
+    return { data: [
+      { appId: 'wechat', appName: '微信功能', useStatus: settings.allow_wechat === false ? 1 : 0 },
+      { appId: 'qq', appName: 'QQ功能', useStatus: settings.allow_qq === false ? 1 : 0 },
+      { appId: 'phone', appName: '电话功能', useStatus: settings.allow_phone === false ? 1 : 0 },
+      { appId: 'call', appName: '通话功能', useStatus: settings.allow_call === false ? 1 : 0 }
+    ] };
   });
   app.put('/api/v1/parent/app/appFunctionControl', async (request: any) => {
     const user = await getAuthUser(app, request); const b = request.body ?? {}; const childId = String(b.childId ?? '');
     const child = await query('SELECT id FROM children WHERE id=$1 AND family_id=$2 AND active=true', [childId, user.familyId]); if (!child.rows[0]) return { error: 'child not found' };
-    await query(`INSERT INTO child_app_settings(child_id,allow_call,allow_wechat,allow_qq,allow_phone) VALUES ($1,$2,$3,$4,$5) ON CONFLICT(child_id) DO UPDATE SET allow_call=EXCLUDED.allow_call,allow_wechat=EXCLUDED.allow_wechat,allow_qq=EXCLUDED.allow_qq,allow_phone=EXCLUDED.allow_phone,updated_at=now()`, [childId,b.allowCall ?? b.allow_call ?? true,b.allowWechat ?? b.allow_wechat ?? true,b.allowQq ?? b.allow_qq ?? true,b.allowPhone ?? b.allow_phone ?? true]);
+    const items = Array.isArray(b.updateChildAppSystemUseStatusList) ? b.updateChildAppSystemUseStatusList : [];
+    const itemValue = (names: string[], fallback: unknown) => {
+      const item = items.find((x: any) => names.includes(String(x.appId ?? x.app_id ?? x.functionCode ?? '').toLowerCase()));
+      return item ? Number(item.useStatus ?? item.status ?? 0) !== 1 : fallback;
+    };
+    const allowWechat = b.allowWechat ?? b.allow_wechat ?? itemValue(['wechat', '2'], true);
+    const allowQq = b.allowQq ?? b.allow_qq ?? itemValue(['qq', '1'], true);
+    const allowPhone = b.allowPhone ?? b.allow_phone ?? itemValue(['phone', '3'], true);
+    const allowCall = b.allowCall ?? b.allow_call ?? itemValue(['call', '4'], true);
+    await query(`INSERT INTO child_app_settings(child_id,allow_call,allow_wechat,allow_qq,allow_phone) VALUES ($1,$2,$3,$4,$5) ON CONFLICT(child_id) DO UPDATE SET allow_call=EXCLUDED.allow_call,allow_wechat=EXCLUDED.allow_wechat,allow_qq=EXCLUDED.allow_qq,allow_phone=EXCLUDED.allow_phone,updated_at=now()`, [childId,allowCall,allowWechat,allowQq,allowPhone]);
+    for (const item of items) if (item.appId ?? item.app_id) await query(`INSERT INTO app_function_policies(child_id,package_name,function_code,disabled) VALUES ($1,$2,$3,$4) ON CONFLICT(child_id,package_name,function_code) DO UPDATE SET disabled=EXCLUDED.disabled,updated_at=now()`, [childId, String(item.appId ?? item.app_id), String(item.functionCode ?? 'legacy'), Number(item.useStatus ?? item.status ?? 0) === 1]);
     await dispatchPolicy(user.familyId, childId, 'function_policy_update', b); return { data: true };
   });
 
@@ -697,7 +724,9 @@ export async function registerRoutes(app: FastifyInstance) {
     return { data: task.rows[0] };
   });
   app.get('/api/v1/parent/app/deletetask/task', async (request: any) => {
-    const user = await getAuthUser(app, request); const childId = String((request.query as any)?.childId ?? ''); const result = await query(`SELECT t.id,t.package_name AS "packageName",t.app_name AS "appName",t.status,t.command_id AS "commandId",t.result,t.requested_at AS "requestedAt",t.completed_at AS "completedAt" FROM delete_tasks t JOIN children c ON c.id=t.child_id WHERE t.child_id=$1 AND c.family_id=$2 ORDER BY t.requested_at DESC LIMIT 100`, [childId, user.familyId]); return { data: result.rows };
+    const user = await getAuthUser(app, request); const q = request.query as any; const childId = String(q?.childId ?? ''); const taskId = String(q?.taskSetId ?? q?.taskId ?? '');
+    const result = await query(`SELECT t.id,t.package_name AS "packageName",t.app_name AS "appName",t.status,t.command_id AS "commandId",t.result,t.requested_at AS "requestedAt",t.completed_at AS "completedAt" FROM delete_tasks t JOIN children c ON c.id=t.child_id WHERE t.child_id=$1 AND c.family_id=$2 AND ($3='' OR t.id::text=$3) ORDER BY t.requested_at DESC LIMIT 100`, [childId, user.familyId, taskId]);
+    return { data: taskId ? (result.rows[0] ?? null) : result.rows };
   });
   app.get('/api/v1/parent/app/getLatestAppVersion', async () => ({ data: { version: config.appVersion, versionName: config.appVersion, downloadUrl: null, forceUpdate: false } }));
   app.get('/api/v1/parent/application/getReleaseVersion', async () => ({ data: { version: config.appVersion, versionName: config.appVersion, downloadUrl: null } }));
@@ -723,6 +752,10 @@ export async function registerRoutes(app: FastifyInstance) {
   app.post('/api/v1/child/childUser/bindChild', async (request: any, reply: any) => { const b=request.body??{}; const bindToken=String(b.bindToken??b.bindCode??b.code??''); const token=String(b.deviceToken??b.token??randomUUID()); const found=await query<{child_id:string}>('SELECT child_id FROM bind_tokens WHERE token=$1 AND used_at IS NULL AND expires_at>now()',[bindToken]); if(!found.rows[0])return reply.code(400).send({message:'绑定码无效或已过期'}); const row=await query<{id:string}>('INSERT INTO devices(child_id,device_token_hash,device_name,brand,model,android_version,client_version,metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb) RETURNING id',[found.rows[0].child_id,hashToken(token),b.deviceName??null,b.brand??null,b.model??null,b.androidVersion??null,b.clientVersion??null,JSON.stringify(b.metadata??{})]); await query('UPDATE bind_tokens SET used_at=now() WHERE token=$1',[bindToken]); return {data:{deviceId:row.rows[0].id,deviceToken:token,childId:found.rows[0].child_id}}; });
   app.get('/api/v1/child/childUser/getChildToken', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; return {data:{deviceId:device.id,childId:device.child_id}}; });
   app.get('/api/v1/child/childUser/getChildInfo', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; const result=await query(`SELECT c.id AS "childId",c.name,c.phone,c.family_id AS "familyId" FROM children c WHERE c.id=$1`,[device.child_id]); return {data:result.rows[0]??null}; });
+  app.get('/api/v1/child/childUser/get/:id', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; const result=await query(`SELECT c.id AS "childId",c.name,c.phone,c.avatar_url AS "avatarUrl",c.family_id AS "familyId" FROM children c WHERE c.id=$1 AND c.id=$2`,[device.child_id,request.params.id]); return {data:result.rows[0]??null}; });
+  app.get('/api/v1/child/childUser/parent', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; const result=await query(`SELECT u.id AS "parentId",u.phone,u.display_name AS "displayName",f.id AS "familyId",f.name AS "familyName" FROM children c JOIN families f ON f.id=c.family_id JOIN users u ON u.id=f.owner_user_id WHERE c.id=$1`,[device.child_id]); return {data:result.rows[0]??null}; });
+  app.get('/api/v1/child/childUser/schoolChildDetail', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; const result=await query(`SELECT c.id AS "childId",c.name,c.phone,c.avatar_url AS "avatarUrl" FROM children c WHERE c.id=$1`,[device.child_id]); return {data:result.rows[0]??null}; });
+  app.put('/api/v1/child/childUser/updateChildInfo', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; const b=request.body??{}; await query('UPDATE children SET name=COALESCE($2,name),phone=COALESCE($3,phone),updated_at=now() WHERE id=$1',[device.child_id,b.name??b.nickName??null,b.phone??null]); return {data:true}; });
   app.post('/api/v1/child/childUser/unBind', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; await query('DELETE FROM devices WHERE id=$1',[device.id]); return {data:true}; });
   app.post('/api/v1/child/childUser/changeChildPolicyInfo', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; const b=request.body??{}; await query(`INSERT INTO control_policies(child_id,name,enabled,no_play_enabled,lock_enabled,allow_call,emergency_numbers,periods,daily_limit_seconds,timezone) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9,$10) ON CONFLICT(child_id) DO UPDATE SET enabled=EXCLUDED.enabled,no_play_enabled=EXCLUDED.no_play_enabled,lock_enabled=EXCLUDED.lock_enabled,allow_call=EXCLUDED.allow_call,emergency_numbers=EXCLUDED.emergency_numbers,periods=EXCLUDED.periods,daily_limit_seconds=EXCLUDED.daily_limit_seconds,timezone=EXCLUDED.timezone,updated_at=now()`,[device.child_id,b.name??'默认管控策略',b.enabled??true,b.noPlayEnabled??false,b.lockEnabled??false,b.allowCall??true,JSON.stringify(b.emergencyNumbers??[]),JSON.stringify(b.periods??[]),b.dailyLimitSeconds??null,b.timezone??'Asia/Shanghai']); return {data:true}; });
   app.get('/api/v1/child/childUser/getChildStatus', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; const result=await query(`SELECT online,battery,network_type AS "networkType",last_seen_at AS "lastSeenAt",control_status AS "controlStatus",device_owner_enabled AS "deviceOwnerEnabled",dpm_restrictions AS "dpmRestrictions" FROM devices WHERE id=$1`,[device.id]); return {data:result.rows[0]??null}; });
@@ -732,6 +765,7 @@ export async function registerRoutes(app: FastifyInstance) {
   app.get('/api/v1/child/controlPolicy/getControlList', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; const result=await query('SELECT * FROM control_policies WHERE child_id=$1',[device.child_id]); return {data:result.rows}; });
   app.get('/api/v1/child/controlPolicy/getPolicylistByChildId', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; const result=await query('SELECT * FROM control_policies WHERE child_id=$1',[device.child_id]); return {data:result.rows}; });
   app.get('/api/v1/child/controlPolicy/getLocateStatus', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; const result=await query('SELECT location_enabled AS "locationEnabled",automatic_location_enabled AS "automaticLocationEnabled" FROM child_app_settings WHERE child_id=$1',[device.child_id]); return {data:result.rows[0]??{locationEnabled:true,automaticLocationEnabled:true}}; });
+  app.get('/api/v1/child/controlPolicy/getCallNumberListByChildId', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; const result=await query('SELECT emergency_numbers AS "emergencyNumbers" FROM control_policies WHERE child_id=$1',[device.child_id]); return {data:result.rows[0]?.emergencyNumbers??[]}; });
   app.get('/api/v1/child/software/appcontrol', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; const result=await query(`SELECT package_name AS "packageName",app_name AS "appName",policy_type AS type,daily_limit_seconds AS "useTime" FROM app_policies WHERE child_id=$1 ORDER BY app_name`,[device.child_id]); return {data:result.rows}; });
   app.post('/api/v1/child/software/appcontrol', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; const items=Array.isArray((request.body??{}).items)?(request.body??{}).items:[request.body??{}]; for(const item of items) if(item.packageName) await query(`INSERT INTO app_policies(child_id,package_name,app_name,policy_type,daily_limit_seconds) VALUES ($1,$2,$3,$4,$5) ON CONFLICT(child_id,package_name) DO UPDATE SET policy_type=EXCLUDED.policy_type,daily_limit_seconds=EXCLUDED.daily_limit_seconds,updated_at=now()`,[device.child_id,item.packageName,item.appName??null,Number(item.type??item.policyType??1),item.useTime??item.dailyLimitSeconds??null]); return {data:true}; });
   app.get('/api/v1/child/software/getTimeList', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; const result=await query('SELECT * FROM control_periods WHERE child_id=$1 AND enabled=true ORDER BY priority,start_time',[device.child_id]); return {data:result.rows}; });
@@ -751,6 +785,11 @@ export async function registerRoutes(app: FastifyInstance) {
   app.get('/api/v1/child/appsettings', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; const result=await query('SELECT * FROM child_app_settings WHERE child_id=$1',[device.child_id]); return {data:result.rows[0]??null}; });
   app.get('/api/v1/child/software/getLatestAppVersion', async () => ({data:{version:config.appVersion,versionName:config.appVersion,downloadUrl:null,forceUpdate:false}}));
   app.get('/api/v1/child/deletetask/taskset/:id', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; const result=await query('SELECT id,package_name AS "packageName",status,result FROM delete_tasks WHERE id=$1 AND child_id=$2',[request.params.id,device.child_id]); return {data:result.rows[0]??null}; });
+  app.get('/api/v1/child/changeChildStatusInfo/:id', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; const result=await query('SELECT online,battery,network_type AS "networkType",last_seen_at AS "lastSeenAt",control_status AS "controlStatus" FROM devices WHERE id=$1 AND id=$2',[device.id,request.params.id]); return {data:result.rows[0]??null}; });
+  app.post('/api/v1/child/common/pushMessage', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; await recordDeviceEvent(device.id,'child_push_message',request.body??{}); return {data:{ok:true}}; });
+  app.post('/api/v1/child/common/upload', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; await recordDeviceEvent(device.id,'child_common_upload',request.body??{}); return {data:{ok:true}}; });
+  app.get('/api/v1/child/common/childDownload', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; return {data:{version:config.appVersion,downloadUrl:null}}; });
+  app.post('/api/v1/child/mobile/tempContent', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; await recordDeviceEvent(device.id,'child_temp_content',request.body??{}); return {data:{ok:true}}; });
 
   app.get('/ws', { websocket: true }, (socket: any, request: any) => {
     let deviceId = '';

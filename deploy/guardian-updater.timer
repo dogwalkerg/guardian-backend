@@ -1,0 +1,11 @@
+[Unit]
+Description=Poll Guardian update requests
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=15s
+AccuracySec=5s
+Unit=guardian-updater.service
+
+[Install]
+WantedBy=timers.target

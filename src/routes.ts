@@ -1,11 +1,48 @@
 import { randomUUID } from 'node:crypto';
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 import type { FastifyInstance } from 'fastify';
 import { config } from './config.js';
 import { query } from './db.js';
-import { getAuthUser, ensureUserAndFamily, issueToken, verifyCaptcha, hashToken } from './auth.js';
+import { getAuthUser, getAdminUser, ensureUserAndFamily, issueAdminToken, issueToken, verifyCaptcha, hashToken, verifyPassword } from './auth.js';
 import type { DeviceMessage } from './protocol.js';
 
 const deviceSockets = new Map<string, any>();
+
+const COMMANDS = {
+  policyUpdate: 'policy_update',
+  appPolicyUpdate: 'app_policy_update',
+  appSettingsUpdate: 'app_settings_update',
+  lock: 'lock',
+  unlock: 'unlock',
+  requestLocation: 'request_location',
+  syncApps: 'sync_apps',
+  syncUsage: 'sync_usage',
+  uninstallApp: 'uninstall_app',
+  unbind: 'unbind',
+  emergencyNumbersUpdate: 'emergency_numbers_update',
+  locationSettingsUpdate: 'location_settings_update',
+  hotspotUpdate: 'hotspot_update',
+  clientUpdate: 'client_update'
+} as const;
+
+const COMMAND_SET = new Set<string>(Object.values(COMMANDS));
+const WIRE_COMMANDS: Record<string, string> = {
+  [COMMANDS.policyUpdate]: 'CONTROL_POLICY_UPDATE',
+  [COMMANDS.appPolicyUpdate]: 'CONTROL_APP_SETTING_CHANGE',
+  [COMMANDS.appSettingsUpdate]: 'CONTROL_APPSYSTEM_CHANGE',
+  [COMMANDS.lock]: 'CONTROL_POLICY_LOCK',
+  [COMMANDS.unlock]: 'CONTROL_POLICY_REMOVE_LOCK',
+  [COMMANDS.requestLocation]: 'LOCATION_NOTIFICAT',
+  [COMMANDS.syncApps]: 'CHILD_UPDATE_DEVICE',
+  [COMMANDS.syncUsage]: 'CHILD_UPDATE_APP_USE_TIME',
+  [COMMANDS.uninstallApp]: 'REMOTE_UNINSTALL_APPLICATION',
+  [COMMANDS.unbind]: 'CHILD_REMOVE_DEVICE',
+  [COMMANDS.emergencyNumbersUpdate]: 'EMERGENCY_NUMBER_UPDATE',
+  [COMMANDS.locationSettingsUpdate]: 'AUTOMATIC_POSITIONING_UPDATE',
+  [COMMANDS.hotspotUpdate]: 'CONTROL_APPSYSTEM_CHANGE',
+  [COMMANDS.clientUpdate]: 'CLIENT_VERSION_UP'
+};
 
 export function broadcastToDevice(deviceId: string, message: DeviceMessage) {
   const socket = deviceSockets.get(deviceId);
@@ -24,24 +61,72 @@ async function markDevice(deviceId: string, online: boolean, patch: Record<strin
     `UPDATE devices SET online=$2, last_seen_at=now(), updated_at=now(),
       last_heartbeat_at=COALESCE($3::timestamptz, last_heartbeat_at),
       battery=COALESCE($4::integer, battery), network_type=COALESCE($5::varchar, network_type),
-      client_version=COALESCE($6::varchar, client_version), metadata=COALESCE($7::jsonb, metadata)
+      client_version=COALESCE($6::varchar, client_version), metadata=COALESCE($7::jsonb, metadata),
+      step_count=COALESCE($8::integer, step_count),
+      current_app_package=COALESCE($9::varchar, current_app_package),
+      current_app_name=COALESCE($10::varchar, current_app_name),
+      current_app_started_at=COALESCE($11::timestamptz, current_app_started_at),
+      control_status=COALESCE($12::varchar, control_status),
+      permissions=COALESCE($13::jsonb, permissions)
      WHERE id=$1`,
-    [deviceId, online, patch.lastHeartbeatAt ?? null, patch.battery ?? null, patch.networkType ?? null, patch.clientVersion ?? null, patch.metadata ? JSON.stringify(patch.metadata) : null]
+    [deviceId, online, patch.lastHeartbeatAt ?? null, patch.battery ?? null, patch.networkType ?? null, patch.clientVersion ?? null,
+      patch.metadata ? JSON.stringify(patch.metadata) : null, patch.stepCount ?? patch.steps ?? null,
+      patch.currentAppPackage ?? patch.current_app_package ?? null, patch.currentAppName ?? patch.current_app_name ?? null,
+      patch.currentAppStartedAt ?? patch.current_app_started_at ?? null, patch.controlStatus ?? patch.control_status ?? null,
+      patch.permissions ? JSON.stringify(patch.permissions) : null]
   );
+}
+
+async function recordDeviceEvent(deviceId: string, eventType: string, payload: Record<string, unknown>) {
+  const device = await query<{ child_id: string }>('SELECT child_id FROM devices WHERE id=$1', [deviceId]);
+  if (!device.rows[0]) return;
+  await query('INSERT INTO device_events(device_id,child_id,event_type,payload) VALUES ($1,$2,$3,$4::jsonb)', [deviceId, device.rows[0].child_id, eventType, JSON.stringify(payload)]);
+}
+
+async function flushQueuedCommands(deviceId: string) {
+  const pending = await query<{ id: string; command: string; payload: Record<string, unknown> }>(`SELECT id,command,payload FROM commands WHERE device_id=$1 AND status='queued' AND (expires_at IS NULL OR expires_at>now()) ORDER BY created_at LIMIT 50`, [deviceId]);
+  for (const item of pending.rows) {
+    const sent = broadcastToDevice(deviceId, { type: 'command', messageId: item.id, command: WIRE_COMMANDS[item.command] ?? item.command, payload: item.payload });
+    if (sent) await query(`UPDATE commands SET status='sent',attempts=attempts+1,sent_at=now(),updated_at=now() WHERE id=$1`, [item.id]);
+  }
 }
 
 async function handleDeviceMessage(deviceId: string, message: DeviceMessage) {
   const payload = message.payload ?? message.result ?? {};
   if (message.type === 'heartbeat' || message.type === 'device_heartbeat' || message.type === 'HEARTBEAT') {
-    await markDevice(deviceId, true, { lastHeartbeatAt: new Date().toISOString(), ...payload });
+    await markDevice(deviceId, true, { lastHeartbeatAt: new Date().toISOString(), ...payload, battery: payload.battery ?? payload.batteryLevel, networkType: payload.networkType ?? payload.network_type, clientVersion: payload.clientVersion ?? payload.client_version });
+    await flushQueuedCommands(deviceId);
+    await recordDeviceEvent(deviceId, message.type, payload);
     return;
   }
   if (message.type === 'device_info' || message.type === 'CHILD_UPDATE_DEVICE') {
-    await markDevice(deviceId, true, payload);
+    await markDevice(deviceId, true, { ...payload, battery: payload.battery ?? payload.batteryLevel, networkType: payload.networkType ?? payload.network_type, clientVersion: payload.clientVersion ?? payload.client_version });
+    await recordDeviceEvent(deviceId, message.type, payload);
     return;
   }
   if (message.type === 'battery' || message.type === 'BATTERY_CHANGE') {
-    await markDevice(deviceId, true, { battery: payload.battery, lastHeartbeatAt: new Date().toISOString() });
+    await markDevice(deviceId, true, { battery: payload.battery ?? payload.batteryLevel, lastHeartbeatAt: new Date().toISOString() });
+    await recordDeviceEvent(deviceId, message.type, payload);
+    return;
+  }
+  if (message.type === 'step' || message.type === 'steps' || message.type === 'STEP_CHANGE' || message.type === 'CHILD_UPDATE_STEP') {
+    const steps = Number(payload.steps ?? payload.stepCount ?? payload.count);
+    if (Number.isFinite(steps) && steps >= 0) {
+      const device = await query<{ child_id: string }>('SELECT child_id FROM devices WHERE id=$1', [deviceId]);
+      await markDevice(deviceId, true, { stepCount: Math.floor(steps), lastHeartbeatAt: new Date().toISOString() });
+      if (device.rows[0]) await query('INSERT INTO step_records(device_id,child_id,steps,recorded_at,day) VALUES ($1,$2,$3,COALESCE($4::timestamptz,now()),COALESCE(($4::timestamptz)::date,current_date))', [deviceId, device.rows[0].child_id, Math.floor(steps), payload.recordedAt ?? null]);
+    }
+    await recordDeviceEvent(deviceId, message.type, payload);
+    return;
+  }
+  if (message.type === 'current_app' || message.type === 'foreground_app' || message.type === 'CHILD_CURRENT_APP') {
+    await markDevice(deviceId, true, { currentAppPackage: payload.packageName ?? payload.package_name, currentAppName: payload.appName ?? payload.app_name, currentAppStartedAt: payload.startedAt ?? payload.startTime, lastHeartbeatAt: new Date().toISOString() });
+    await recordDeviceEvent(deviceId, message.type, payload);
+    return;
+  }
+  if (message.type === 'permission_status' || message.type === 'permissions' || message.type === 'CHILD_CONTROL_STATUS_CHANGE') {
+    await markDevice(deviceId, true, { permissions: payload.permissions ?? payload, controlStatus: payload.controlStatus ?? payload.status, lastHeartbeatAt: new Date().toISOString() });
+    await recordDeviceEvent(deviceId, message.type, payload);
     return;
   }
   if (message.type === 'location' || message.type === 'location_upload' || message.type === 'CHILD_LOCATION_CHANGE') {
@@ -54,7 +139,9 @@ async function handleDeviceMessage(deviceId: string, message: DeviceMessage) {
          VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7::timestamptz,now()),$8)`,
         [deviceId, device.rows[0].child_id, lat, lng, payload.accuracy ?? null, payload.address ?? null, payload.recordedAt ?? null, payload.source ?? 'device']
       );
+      await query('UPDATE devices SET last_location_at=COALESCE($2::timestamptz,now()),last_seen_at=now(),online=true,updated_at=now() WHERE id=$1', [deviceId, payload.recordedAt ?? null]);
     }
+    await recordDeviceEvent(deviceId, message.type, payload);
     return;
   }
   if (message.type === 'usage' || message.type === 'usage_upload' || message.type === 'CHILD_UPLOAD_APP_USE_TIME' || message.type === 'CHILD_UPDATE_APP_USE_TIME') {
@@ -70,6 +157,8 @@ async function handleDeviceMessage(deviceId: string, message: DeviceMessage) {
         [deviceId, device.rows[0].child_id, item.packageName ?? item.package_name, item.appName ?? item.app_name ?? null, start, seconds]
       );
     }
+    await query('UPDATE devices SET last_usage_sync_at=now(),last_seen_at=now(),online=true,updated_at=now() WHERE id=$1', [deviceId]);
+    await recordDeviceEvent(deviceId, message.type, payload);
     return;
   }
   if (message.type === 'apps' || message.type === 'apps_upload' || message.type === 'CHILD_APP_SYSTEM_LIST') {
@@ -84,16 +173,21 @@ async function handleDeviceMessage(deviceId: string, message: DeviceMessage) {
         [deviceId, packageName, item.appName ?? item.app_name ?? packageName, item.versionName ?? item.version_name ?? null, String(item.versionCode ?? item.version_code ?? ''), item.iconUrl ?? item.icon_url ?? null, item.isSystem ?? item.is_system ?? false]
       );
     }
+    await query('UPDATE devices SET last_apps_sync_at=now(),last_seen_at=now(),online=true,updated_at=now() WHERE id=$1', [deviceId]);
+    await recordDeviceEvent(deviceId, message.type, { count: apps.length });
     return;
   }
-  if (message.type === 'command_result' || message.type === 'control_result' || message.status) {
-    const messageId = message.messageId;
+  if (message.type === 'REMOTE_UNINSTALL_APPLICATION_DONE' || message.type === 'command_result' || message.type === 'control_result' || message.status) {
+    const messageId = message.messageId ?? String(payload.messageId ?? payload.commandId ?? '');
     if (!messageId) return;
+    const finalStatus = payload.success === true || ['success', 'succeeded', 'ok', 'completed'].includes(String(message.status ?? payload.status ?? '').toLowerCase()) ? 'succeeded' : 'failed';
     await query(
       `UPDATE commands SET status=$2, result=$3::jsonb, acknowledged_at=now(), updated_at=now()
        WHERE id=$1`,
-      [messageId, message.status === 'success' ? 'succeeded' : 'failed', JSON.stringify(message.result ?? payload)]
+      [messageId, finalStatus, JSON.stringify(message.result ?? payload)]
     );
+    await query('UPDATE delete_tasks SET status=$2,result=$3::jsonb,completed_at=now() WHERE command_id=$1', [messageId, finalStatus, JSON.stringify(message.result ?? payload)]);
+    await recordDeviceEvent(deviceId, message.type, { messageId, status: finalStatus, ...(message.result ?? payload) });
   }
 }
 
@@ -101,9 +195,261 @@ async function authOrNull(app: FastifyInstance, request: any) {
   try { return await getAuthUser(app, request); } catch { return null; }
 }
 
+async function readJsonFile(filePath: string, fallback: unknown) {
+  try { return JSON.parse(await readFile(filePath, 'utf8')); } catch { return fallback; }
+}
+
+async function writeJsonFile(filePath: string, value: unknown) {
+  await mkdir(path.dirname(filePath), { recursive: true });
+  const temporary = `${filePath}.${process.pid}.tmp`;
+  await writeFile(temporary, JSON.stringify(value, null, 2), { encoding: 'utf8', mode: 0o600 });
+  await rename(temporary, filePath);
+}
+
+function compareVersions(current: string, latest: string) {
+  const parse = (value: string) => value.replace(/^v/, '').split('-')[0].split('.').slice(0, 3).map((item) => Number.parseInt(item, 10) || 0);
+  const a = parse(current); const b = parse(latest);
+  for (let i = 0; i < 3; i += 1) { if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1; }
+  return 0;
+}
+
+async function adminChild(childId: string) {
+  const result = await query<{ id: string; family_id: string; device_id: string | null; online: boolean | null }>(`SELECT c.id,c.family_id,d.id AS device_id,d.online FROM children c LEFT JOIN LATERAL (SELECT id,online FROM devices WHERE child_id=c.id ORDER BY updated_at DESC LIMIT 1) d ON true WHERE c.id=$1 AND c.active=true`, [childId]);
+  return result.rows[0] ?? null;
+}
+
+async function dispatchAdminCommand(childId: string, command: string, payload: Record<string, unknown>, username: string) {
+  if (!COMMAND_SET.has(command)) throw new Error('command is not allowed');
+  const child = await adminChild(childId);
+  if (!child?.device_id) return null;
+  const commandId = randomUUID();
+  const online = isDeviceOnline(child.device_id);
+  const status = online ? 'sent' : 'queued';
+  await query(`INSERT INTO commands(id,device_id,child_id,command,payload,status,attempts,sent_at,expires_at) VALUES($1,$2,$3,$4,$5::jsonb,$6,$7,$8,now()+interval '24 hours')`, [commandId, child.device_id, childId, command, JSON.stringify(payload), status, online ? 1 : 0, online ? new Date().toISOString() : null]);
+  let delivered = false;
+  if (online) {
+    delivered = broadcastToDevice(child.device_id, { type: 'command', messageId: commandId, command: WIRE_COMMANDS[command] ?? command, payload });
+    if (!delivered) await query(`UPDATE commands SET status='queued',attempts=0,sent_at=NULL,updated_at=now() WHERE id=$1`, [commandId]);
+  }
+  await query('INSERT INTO admin_audit_logs(username,action,family_id,child_id,device_id,detail) VALUES ($1,$2,$3,$4,$5,$6::jsonb)', [username, `command:${command}`, child.family_id, childId, child.device_id, JSON.stringify({ commandId, payload, status: delivered ? 'sent' : status })]);
+  return { commandId, deviceId: child.device_id, status: delivered ? 'sent' : status, delivered };
+}
+
 export async function registerRoutes(app: FastifyInstance) {
   app.get('/health', async () => ({ ok: true, service: 'guardian-backend', time: new Date().toISOString() }));
   app.get('/api/health', async () => ({ ok: true, service: 'guardian-backend', time: new Date().toISOString() }));
+
+  app.post('/api/v1/admin/auth/login', async (request: any, reply) => {
+    const body = request.body ?? {};
+    const username = String(body.username ?? '').trim();
+    const password = String(body.password ?? '');
+    const validUser = username === config.adminUsername;
+    const validPassword = config.adminPasswordHash
+      ? await verifyPassword(password, config.adminPasswordHash)
+      : config.nodeEnv !== 'production' && password === config.adminPassword;
+    if (!validUser || !validPassword) return reply.code(401).send({ message: '管理员账号或密码错误' });
+    const token = await issueAdminToken(app, username);
+    return { data: { token, accessToken: token, username, role: 'admin' }, token };
+  });
+
+  app.get('/api/v1/admin/auth/me', async (request: any, reply) => {
+    try { return { data: await getAdminUser(app, request) }; } catch { return reply.code(401).send({ message: '管理员登录已失效' }); }
+  });
+
+  const requireAdmin = async (request: any, reply: any) => {
+    try { return await getAdminUser(app, request); } catch { await reply.code(401).send({ message: '需要管理员登录' }); return null; }
+  };
+
+  app.get('/api/v1/admin/overview', async (request: any, reply) => {
+    const admin = await requireAdmin(request, reply); if (!admin) return;
+    const [counts, devices, events] = await Promise.all([
+      query(`SELECT (SELECT count(*) FROM families)::int AS families,(SELECT count(*) FROM users)::int AS parents,(SELECT count(*) FROM children WHERE active=true)::int AS children,(SELECT count(*) FROM devices)::int AS devices,(SELECT count(*) FROM devices WHERE online=true)::int AS online_devices,(SELECT count(*) FROM devices WHERE online=false)::int AS offline_devices`),
+      query(`SELECT d.id AS "deviceId",d.child_id AS "childId",c.name AS "childName",f.id AS "familyId",f.name AS "familyName",d.device_name AS "deviceName",d.brand,d.model,d.android_version AS "androidVersion",d.client_version AS "clientVersion",d.online,d.battery,d.network_type AS "networkType",d.last_heartbeat_at AS "lastHeartbeatAt",d.last_seen_at AS "lastSeenAt",d.step_count AS "stepCount",d.current_app_package AS "currentAppPackage",d.current_app_name AS "currentAppName",d.control_status AS "controlStatus",d.permissions,d.last_location_at AS "lastLocationAt",d.last_usage_sync_at AS "lastUsageSyncAt",d.last_apps_sync_at AS "lastAppsSyncAt" FROM devices d JOIN children c ON c.id=d.child_id JOIN families f ON f.id=c.family_id ORDER BY d.online DESC,d.last_seen_at DESC NULLS LAST LIMIT 200`),
+      query(`SELECT id,event_type AS "eventType",payload,created_at AS "createdAt" FROM device_events ORDER BY created_at DESC LIMIT 20`)
+    ]);
+    return { data: { ...(counts.rows[0] ?? {}), devices: devices.rows, recentEvents: events.rows, checkedAt: new Date().toISOString(), admin: admin.username } };
+  });
+
+  app.get('/api/v1/admin/families', async (request: any, reply) => {
+    if (!await requireAdmin(request, reply)) return;
+    const q = request.query ?? {};
+    const result = await query(`SELECT f.id AS "familyId",f.name AS "familyName",f.created_at AS "createdAt",u.id AS "parentId",u.phone,u.display_name AS "displayName",(SELECT count(*) FROM children c WHERE c.family_id=f.id AND c.active=true)::int AS "childCount",(SELECT count(*) FROM devices d JOIN children c ON c.id=d.child_id WHERE c.family_id=f.id AND d.online=true)::int AS "onlineDevices" FROM families f JOIN users u ON u.id=f.owner_user_id WHERE ($1='' OR f.name ILIKE '%'||$1||'%' OR u.phone ILIKE '%'||$1||'%') ORDER BY f.created_at DESC LIMIT 200`, [String(q.search ?? '')]);
+    return { data: result.rows };
+  });
+
+  app.get('/api/v1/admin/families/:familyId', async (request: any, reply) => {
+    if (!await requireAdmin(request, reply)) return;
+    const result = await query(`SELECT f.id AS "familyId",f.name AS "familyName",u.id AS "parentId",u.phone,u.display_name AS "displayName",json_agg(json_build_object('childId',c.id,'name',c.name,'phone',c.phone,'active',c.active,'devices',(SELECT coalesce(json_agg(json_build_object('deviceId',d.id,'deviceName',d.device_name,'brand',d.brand,'model',d.model,'online',d.online,'battery',d.battery,'lastSeenAt',d.last_seen_at,'controlStatus',d.control_status)), '[]'::json) FROM devices d WHERE d.child_id=c.id))) FILTER (WHERE c.id IS NOT NULL) AS children FROM families f JOIN users u ON u.id=f.owner_user_id LEFT JOIN children c ON c.family_id=f.id WHERE f.id=$1 GROUP BY f.id,u.id`, [request.params.familyId]);
+    if (!result.rows[0]) return reply.code(404).send({ message: '家庭不存在' });
+    return { data: result.rows[0] };
+  });
+
+  app.get('/api/v1/admin/children/:childId', async (request: any, reply) => {
+    if (!await requireAdmin(request, reply)) return;
+    const child = await query(`SELECT c.id AS "childId",c.name,c.phone,c.active,f.id AS "familyId",f.name AS "familyName",u.phone AS "parentPhone",d.id AS "deviceId",d.device_name,d.brand,d.model,d.android_version,d.client_version,d.battery,d.network_type,d.online,d.last_heartbeat_at,d.last_seen_at,d.permissions,d.metadata,d.step_count,d.current_app_package,d.current_app_name,d.current_app_started_at,d.control_status,d.last_location_at,d.last_usage_sync_at,d.last_apps_sync_at FROM children c JOIN families f ON f.id=c.family_id JOIN users u ON u.id=f.owner_user_id LEFT JOIN LATERAL (SELECT * FROM devices WHERE child_id=c.id ORDER BY updated_at DESC LIMIT 1) d ON true WHERE c.id=$1`, [request.params.childId]);
+    if (!child.rows[0]) return reply.code(404).send({ message: '孩子不存在' });
+    const [policy, settings, apps, location, usage, commands, events] = await Promise.all([
+      query('SELECT * FROM control_policies WHERE child_id=$1', [request.params.childId]),
+      query('SELECT * FROM child_app_settings WHERE child_id=$1', [request.params.childId]),
+      query(`SELECT a.package_name AS "packageName",a.app_name AS "appName",a.version_name AS "versionName",a.version_code AS "versionCode",a.is_system AS "isSystem",a.last_seen_at AS "lastSeenAt",p.policy_type AS "policyType",p.daily_limit_seconds AS "dailyLimitSeconds" FROM installed_apps a LEFT JOIN app_policies p ON p.child_id=$1 AND p.package_name=a.package_name JOIN devices d ON d.id=a.device_id WHERE d.child_id=$1 ORDER BY a.app_name`, [request.params.childId]),
+      query(`SELECT latitude,longitude,accuracy,address,recorded_at AS "recordedAt",source FROM location_records WHERE child_id=$1 ORDER BY recorded_at DESC LIMIT 100`, [request.params.childId]),
+      query(`SELECT package_name AS "packageName",max(app_name) AS "appName",sum(use_seconds)::int AS "useSeconds",day FROM usage_records WHERE child_id=$1 GROUP BY package_name,day ORDER BY day DESC,"useSeconds" DESC LIMIT 500`, [request.params.childId]),
+      query(`SELECT id,command,payload,status,attempts,sent_at AS "sentAt",acknowledged_at AS "acknowledgedAt",result,created_at AS "createdAt" FROM commands WHERE child_id=$1 ORDER BY created_at DESC LIMIT 100`, [request.params.childId]),
+      query(`SELECT id,event_type AS "eventType",payload,created_at AS "createdAt" FROM device_events WHERE child_id=$1 ORDER BY created_at DESC LIMIT 100`, [request.params.childId])
+    ]);
+    return { data: { child: child.rows[0], policy: policy.rows[0] ?? null, settings: settings.rows[0] ?? null, apps: apps.rows, locationHistory: location.rows, usage: usage.rows, commands: commands.rows, events: events.rows } };
+  });
+
+  app.get('/api/v1/admin/children/:childId/location/history', async (request: any, reply) => {
+    if (!await requireAdmin(request, reply)) return;
+    const result = await query(`SELECT latitude,longitude,accuracy,address,recorded_at AS "recordedAt",source FROM location_records WHERE child_id=$1 ORDER BY recorded_at DESC LIMIT 500`, [request.params.childId]);
+    return { data: result.rows };
+  });
+  app.get('/api/v1/admin/children/:childId/usage', async (request: any, reply) => {
+    if (!await requireAdmin(request, reply)) return;
+    const result = await query(`SELECT package_name AS "packageName",max(app_name) AS "appName",sum(use_seconds)::int AS "useSeconds",day FROM usage_records WHERE child_id=$1 AND day BETWEEN COALESCE($2::date,current_date-30) AND COALESCE($3::date,current_date) GROUP BY package_name,day ORDER BY day DESC,"useSeconds" DESC`, [request.params.childId, request.query?.from ?? null, request.query?.to ?? null]);
+    return { data: result.rows };
+  });
+  app.get('/api/v1/admin/children/:childId/steps', async (request: any, reply) => {
+    if (!await requireAdmin(request, reply)) return;
+    const result = await query(`SELECT steps,recorded_at AS "recordedAt",day FROM step_records WHERE child_id=$1 ORDER BY recorded_at DESC LIMIT 500`, [request.params.childId]);
+    return { data: result.rows };
+  });
+  app.get('/api/v1/admin/children/:childId/apps', async (request: any, reply) => {
+    if (!await requireAdmin(request, reply)) return;
+    const result = await query(`SELECT a.package_name AS "packageName",a.app_name AS "appName",a.version_name AS "versionName",a.version_code AS "versionCode",a.is_system AS "isSystem",a.last_seen_at AS "lastSeenAt",p.policy_type AS "policyType",p.daily_limit_seconds AS "dailyLimitSeconds" FROM installed_apps a JOIN devices d ON d.id=a.device_id LEFT JOIN app_policies p ON p.child_id=$1 AND p.package_name=a.package_name WHERE d.child_id=$1 ORDER BY a.app_name`, [request.params.childId]);
+    return { data: result.rows };
+  });
+  app.get('/api/v1/admin/children/:childId/commands', async (request: any, reply) => {
+    if (!await requireAdmin(request, reply)) return;
+    const result = await query(`SELECT id,command,payload,status,attempts,sent_at AS "sentAt",acknowledged_at AS "acknowledgedAt",result,created_at AS "createdAt" FROM commands WHERE child_id=$1 ORDER BY created_at DESC LIMIT 200`, [request.params.childId]);
+    return { data: result.rows };
+  });
+  app.get('/api/v1/admin/children/:childId/logs', async (request: any, reply) => {
+    if (!await requireAdmin(request, reply)) return;
+    const result = await query(`SELECT id,event_type AS "eventType",payload,created_at AS "createdAt" FROM device_events WHERE child_id=$1 ORDER BY created_at DESC LIMIT 200`, [request.params.childId]);
+    return { data: result.rows };
+  });
+  app.get('/api/v1/admin/logs', async (request: any, reply) => {
+    if (!await requireAdmin(request, reply)) return;
+    const result = await query(`SELECT id,username,action,family_id AS "familyId",child_id AS "childId",device_id AS "deviceId",detail,created_at AS "createdAt" FROM admin_audit_logs ORDER BY created_at DESC LIMIT 300`);
+    return { data: result.rows };
+  });
+
+  app.get('/api/v1/admin/system/version', async (request: any, reply) => {
+    if (!await requireAdmin(request, reply)) return;
+    const fallback = { currentVersion: config.appVersion, latestVersion: config.appVersion, updateAvailable: false, releaseNotes: '', publishedAt: null, image: config.updateImage };
+    if (!config.updateEnabled) return { data: fallback };
+    try {
+      const response = await fetch(`https://api.github.com/repos/${config.updateRepository}/releases/latest`, { headers: { accept: 'application/vnd.github+json', 'user-agent': 'guardian-backend' } });
+      if (!response.ok) return { data: { ...fallback, warning: `GitHub release check failed (${response.status})` } };
+      const release: any = await response.json();
+      const latestVersion = String(release.tag_name ?? '').replace(/^v/, '') || config.appVersion;
+      return { data: { currentVersion: config.appVersion, latestVersion, updateAvailable: compareVersions(config.appVersion, latestVersion) < 0, releaseNotes: release.body ?? '', publishedAt: release.published_at ?? null, image: config.updateImage, releaseUrl: release.html_url ?? null } };
+    } catch (error) { return { data: { ...fallback, warning: error instanceof Error ? error.message : 'release check failed' } }; }
+  });
+
+  app.get('/api/v1/admin/system/releases', async (request: any, reply) => {
+    if (!await requireAdmin(request, reply)) return;
+    try {
+      const response = await fetch(`https://api.github.com/repos/${config.updateRepository}/releases?per_page=10`, { headers: { accept: 'application/vnd.github+json', 'user-agent': 'guardian-backend' } });
+      if (!response.ok) return reply.code(502).send({ message: `release list failed (${response.status})` });
+      const releases: any[] = await response.json();
+      return { data: releases.filter((item) => !item.draft && !item.prerelease).map((item) => ({ version: String(item.tag_name ?? '').replace(/^v/, ''), name: item.name, releaseNotes: item.body ?? '', publishedAt: item.published_at, url: item.html_url })) };
+    } catch (error) { return reply.code(502).send({ message: error instanceof Error ? error.message : 'release list failed' }); }
+  });
+
+  app.get('/api/v1/admin/system/update/status', async (request: any, reply) => {
+    if (!await requireAdmin(request, reply)) return;
+    return { data: await readJsonFile(config.updateStatusPath, { status: 'idle', currentVersion: config.appVersion }) };
+  });
+  app.post('/api/v1/admin/system/update', async (request: any, reply) => {
+    const admin = await requireAdmin(request, reply); if (!admin) return;
+    if (!config.updateEnabled) return reply.code(409).send({ message: '后台更新功能已禁用' });
+    const current = await readJsonFile(config.updateStatusPath, { status: 'idle' }) as any;
+    if (['requested', 'pulling', 'restarting'].includes(String(current.status))) return reply.code(409).send({ message: '已有更新任务正在执行', data: current });
+    const version = String((request.body ?? {}).version ?? 'latest').trim();
+    const image = version === 'latest' ? config.updateImage : `${config.updateImage.split(':')[0]}:v${version.replace(/^v/, '')}`;
+    const requestedAt = new Date().toISOString();
+    await writeJsonFile(config.updateRequestPath, { id: randomUUID(), requestedBy: admin.username, version, image, requestedAt });
+    await writeJsonFile(config.updateStatusPath, { status: 'requested', message: 'update request queued', version, requestedAt });
+    await query('INSERT INTO admin_audit_logs(username,action,detail) VALUES ($1,$2,$3::jsonb)', [admin.username, 'system_update_requested', JSON.stringify({ version })]);
+    return { data: { status: 'requested', version } };
+  });
+
+  app.post('/api/v1/admin/system/rollback', async (request: any, reply) => {
+    const admin = await requireAdmin(request, reply); if (!admin) return;
+    if (!config.updateEnabled) return reply.code(409).send({ message: '后台更新功能已禁用' });
+    const version = String((request.body ?? {}).version ?? '').trim();
+    if (!version) return reply.code(400).send({ message: 'version is required' });
+    const requestedAt = new Date().toISOString();
+    await writeJsonFile(config.updateRequestPath, { id: randomUUID(), requestedBy: admin.username, version, rollback: true, image: `${config.updateImage.split(':')[0]}:${version.startsWith('v') ? version : `v${version}`}`, requestedAt });
+    await writeJsonFile(config.updateStatusPath, { status: 'requested', message: 'rollback request queued', version, requestedAt });
+    await query('INSERT INTO admin_audit_logs(username,action,detail) VALUES ($1,$2,$3::jsonb)', [admin.username, 'system_rollback_requested', JSON.stringify({ version })]);
+    return { data: { status: 'requested', version, rollback: true } };
+  });
+
+  app.post('/api/v1/admin/children/:childId/commands', async (request: any, reply) => {
+    const admin = await requireAdmin(request, reply); if (!admin) return;
+    const command = String((request.body ?? {}).command ?? '');
+    const payload = ((request.body ?? {}).payload ?? {}) as Record<string, unknown>;
+    if (!COMMAND_SET.has(command)) return reply.code(400).send({ message: '不允许的设备命令' });
+    const result = await dispatchAdminCommand(String(request.params.childId), command, payload, admin.username);
+    if (!result) return reply.code(404).send({ message: '孩子或设备不存在' });
+    return { data: result };
+  });
+
+  app.put('/api/v1/admin/children/:childId/policy', async (request: any, reply) => {
+    const admin = await requireAdmin(request, reply); if (!admin) return;
+    const childId = String(request.params.childId); const b = request.body ?? {};
+    const child = await adminChild(childId); if (!child) return reply.code(404).send({ message: '孩子不存在' });
+    await query(`INSERT INTO control_policies(child_id,name,enabled,no_play_enabled,lock_enabled,allow_call,emergency_numbers,periods,daily_limit_seconds,timezone) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9,$10) ON CONFLICT(child_id) DO UPDATE SET name=EXCLUDED.name,enabled=EXCLUDED.enabled,no_play_enabled=EXCLUDED.no_play_enabled,lock_enabled=EXCLUDED.lock_enabled,allow_call=EXCLUDED.allow_call,emergency_numbers=EXCLUDED.emergency_numbers,periods=EXCLUDED.periods,daily_limit_seconds=EXCLUDED.daily_limit_seconds,timezone=EXCLUDED.timezone,updated_at=now()`, [childId, b.name ?? '默认管控策略', b.enabled ?? true, b.noPlayEnabled ?? false, b.lockEnabled ?? false, b.allowCall ?? true, JSON.stringify(b.emergencyNumbers ?? []), JSON.stringify(b.periods ?? []), b.dailyLimitSeconds ?? null, b.timezone ?? 'Asia/Shanghai']);
+    const command = await dispatchAdminCommand(childId, COMMANDS.policyUpdate, b, admin.username);
+    return { data: { saved: true, command } };
+  });
+  app.put('/api/v1/admin/children/:childId/app-settings', async (request: any, reply) => {
+    const admin = await requireAdmin(request, reply); if (!admin) return;
+    const childId = String(request.params.childId); const b = request.body ?? {};
+    if (!await adminChild(childId)) return reply.code(404).send({ message: '孩子不存在' });
+    await query(`INSERT INTO child_app_settings(child_id,allow_new_apps,offline_mode,location_enabled,automatic_location_enabled,hotspot_enabled) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT(child_id) DO UPDATE SET allow_new_apps=EXCLUDED.allow_new_apps,offline_mode=EXCLUDED.offline_mode,location_enabled=EXCLUDED.location_enabled,automatic_location_enabled=EXCLUDED.automatic_location_enabled,hotspot_enabled=EXCLUDED.hotspot_enabled,updated_at=now()`, [childId, b.allowNewApps ?? true, b.offlineMode ?? 'allow', b.locationEnabled ?? true, b.automaticLocationEnabled ?? true, b.hotspotEnabled ?? true]);
+    const command = await dispatchAdminCommand(childId, COMMANDS.appSettingsUpdate, b, admin.username);
+    return { data: { saved: true, command } };
+  });
+  app.put('/api/v1/admin/children/:childId/app-policies', async (request: any, reply) => {
+    const admin = await requireAdmin(request, reply); if (!admin) return;
+    const childId = String(request.params.childId); if (!await adminChild(childId)) return reply.code(404).send({ message: '孩子不存在' });
+    const items = Array.isArray((request.body ?? {}).items) ? (request.body as any).items : [request.body ?? {}];
+    for (const item of items) if (item.packageName) await query(`INSERT INTO app_policies(child_id,package_name,app_name,policy_type,daily_limit_seconds,enabled) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT(child_id,package_name) DO UPDATE SET app_name=EXCLUDED.app_name,policy_type=EXCLUDED.policy_type,daily_limit_seconds=EXCLUDED.daily_limit_seconds,enabled=EXCLUDED.enabled,updated_at=now()`, [childId, item.packageName, item.appName ?? null, Number(item.policyType ?? item.type ?? 1), item.dailyLimitSeconds ?? item.useTime ?? null, item.enabled ?? true]);
+    const command = await dispatchAdminCommand(childId, COMMANDS.appPolicyUpdate, { items }, admin.username);
+    return { data: { saved: true, command } };
+  });
+
+  for (const [route, command] of [['emergency-numbers', COMMANDS.emergencyNumbersUpdate], ['location-settings', COMMANDS.locationSettingsUpdate], ['hotspot', COMMANDS.hotspotUpdate], ['client-update', COMMANDS.clientUpdate]] as const) {
+    app.post(`/api/v1/admin/children/:childId/${route}`, async (request: any, reply) => {
+      const admin = await requireAdmin(request, reply); if (!admin) return;
+      const result = await dispatchAdminCommand(String(request.params.childId), command, request.body ?? {}, admin.username);
+      if (!result) return reply.code(404).send({ message: '孩子或设备不存在' });
+      return { data: result };
+    });
+  }
+
+  for (const [route, command] of [['lock', COMMANDS.lock], ['unlock', COMMANDS.unlock], ['request-location', COMMANDS.requestLocation], ['sync-apps', COMMANDS.syncApps], ['sync-usage', COMMANDS.syncUsage], ['unbind', COMMANDS.unbind]] as const) {
+    app.post(`/api/v1/admin/children/:childId/${route}`, async (request: any, reply) => {
+      const admin = await requireAdmin(request, reply); if (!admin) return;
+      const result = await dispatchAdminCommand(String(request.params.childId), command, request.body ?? {}, admin.username);
+      if (!result) return reply.code(404).send({ message: '孩子或设备不存在' });
+      return { data: result };
+    });
+  }
+  app.post('/api/v1/admin/children/:childId/uninstall', async (request: any, reply) => {
+    const admin = await requireAdmin(request, reply); if (!admin) return;
+    const childId = String(request.params.childId); const packageName = String((request.body ?? {}).packageName ?? '');
+    if (!packageName) return reply.code(400).send({ message: 'packageName is required' });
+    const result = await dispatchAdminCommand(childId, COMMANDS.uninstallApp, { packageName, appName: (request.body ?? {}).appName ?? null }, admin.username);
+    if (!result) return reply.code(404).send({ message: '孩子或设备不存在' });
+    await query(`INSERT INTO delete_tasks(child_id,device_id,package_name,app_name,status,command_id) VALUES ($1,$2,$3,$4,$5,$6)`, [childId, result.deviceId, packageName, (request.body ?? {}).appName ?? null, result.status, result.commandId]);
+    return { data: result };
+  });
 
   app.post('/api/v1/auth/account/sendCaptcha', async (request: any) => {
     const body = request.body ?? {};
@@ -142,7 +488,7 @@ export async function registerRoutes(app: FastifyInstance) {
 
   app.post('/api/v1/parent/index/getDeviceInfo', async (request: any) => {
     const user = await getAuthUser(app, request); const childId = String((request.body ?? {}).childId ?? '');
-    const result = await query(`SELECT d.* FROM devices d JOIN children c ON c.id=d.child_id WHERE d.child_id=$1 AND c.family_id=$2 ORDER BY d.updated_at DESC LIMIT 1`, [childId, user.familyId]);
+    const result = await query(`SELECT d.id AS "deviceId",d.child_id AS "childId",d.device_name AS "deviceName",d.brand,d.model,d.android_version AS "androidVersion",d.client_version AS "clientVersion",d.battery,d.network_type AS "networkType",d.online,d.last_heartbeat_at AS "lastHeartbeatAt",d.last_seen_at AS "lastSeenAt",d.permissions,d.metadata,d.step_count AS "stepCount",d.current_app_package AS "currentAppPackage",d.current_app_name AS "currentAppName",d.control_status AS "controlStatus",d.last_location_at AS "lastLocationAt",d.last_usage_sync_at AS "lastUsageSyncAt",d.last_apps_sync_at AS "lastAppsSyncAt" FROM devices d JOIN children c ON c.id=d.child_id WHERE d.child_id=$1 AND c.family_id=$2 ORDER BY d.updated_at DESC LIMIT 1`, [childId, user.familyId]);
     return { data: result.rows[0] ?? null };
   });
 
@@ -229,6 +575,7 @@ export async function registerRoutes(app: FastifyInstance) {
           const device = byId.rows[0] && hashToken(token) === byId.rows[0].device_token_hash ? byId.rows[0] : null;
           if (!device) { socket.close(4001, 'unauthorized'); return; }
           deviceId = device.id; deviceSockets.set(deviceId, socket); await markDevice(deviceId,true,{lastHeartbeatAt:new Date().toISOString(),clientVersion:(message.payload??{}).clientVersion});
+          await flushQueuedCommands(deviceId);
           socket.send(JSON.stringify({type:'hello_ack',status:'success',deviceId})); return;
         }
         if (!deviceId) { socket.close(4001, 'hello required'); return; }
@@ -248,8 +595,13 @@ async function findDevice(request:any) {
 }
 
 async function dispatchPolicy(familyId:string, childId:string, command:string, payload:Record<string,unknown>) {
-  const device=await query<{id:string}>('SELECT d.id FROM devices d JOIN children c ON c.id=d.child_id WHERE c.id=$1 AND c.family_id=$2 ORDER BY d.updated_at DESC LIMIT 1',[childId,familyId]); if(!device.rows[0]) return null;
-  const id=randomUUID(); await query(`INSERT INTO commands(id,device_id,child_id,command,payload,expires_at) VALUES($1,$2,$3,$4,$5::jsonb,now()+interval '24 hours')`,[id,device.rows[0].id,childId,command,JSON.stringify(payload)]);
-  broadcastToDevice(device.rows[0].id,{type:'command',messageId:id,command,payload}); return id;
+  const device = await query<{ id: string }>('SELECT d.id FROM devices d JOIN children c ON c.id=d.child_id WHERE c.id=$1 AND c.family_id=$2 ORDER BY d.updated_at DESC LIMIT 1', [childId, familyId]);
+  if (!device.rows[0]) return null;
+  const id = randomUUID();
+  const online = isDeviceOnline(device.rows[0].id);
+  await query(`INSERT INTO commands(id,device_id,child_id,command,payload,status,attempts,expires_at) VALUES($1,$2,$3,$4,$5::jsonb,'queued',0,now()+interval '24 hours')`, [id, device.rows[0].id, childId, command, JSON.stringify(payload)]);
+  const sent = online && broadcastToDevice(device.rows[0].id, { type: 'command', messageId: id, command: WIRE_COMMANDS[command] ?? command, payload });
+  if (sent) await query(`UPDATE commands SET status='sent',attempts=1,sent_at=now(),updated_at=now() WHERE id=$1`, [id]);
+  return id;
 }
 

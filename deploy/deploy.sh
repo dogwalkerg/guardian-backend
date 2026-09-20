@@ -7,6 +7,9 @@ if [[ ! -f .env ]]; then
   exit 1
 fi
 
+mkdir -p runtime
+chown -R 1000:1000 runtime
+
 docker compose build guardian-api
 docker compose up -d guardian-postgres guardian-redis
 docker compose up -d guardian-api guardian-worker

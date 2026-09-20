@@ -4,6 +4,7 @@ import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { query } from './db.js';
 
 export type AuthUser = { id: string; phone: string; familyId: string };
+export type AdminUser = { username: string; role: 'admin' };
 
 export async function issueToken(app: FastifyInstance, user: AuthUser) {
   return app.jwt.sign({ sub: user.id, phone: user.phone, familyId: user.familyId });
@@ -11,8 +12,22 @@ export async function issueToken(app: FastifyInstance, user: AuthUser) {
 
 export async function getAuthUser(app: FastifyInstance, request: FastifyRequest): Promise<AuthUser> {
   await request.jwtVerify();
-  const payload = request.user as { sub: string; phone: string; familyId: string };
+  const payload = request.user as { sub?: string; phone?: string; familyId?: string; role?: string };
+  if (payload.role === 'admin' || !payload.sub || !payload.phone || !payload.familyId) {
+    throw new Error('parent token required');
+  }
   return { id: payload.sub, phone: payload.phone, familyId: payload.familyId };
+}
+
+export async function issueAdminToken(app: FastifyInstance, username: string) {
+  return app.jwt.sign({ role: 'admin', username, sub: `admin:${username}` });
+}
+
+export async function getAdminUser(app: FastifyInstance, request: FastifyRequest): Promise<AdminUser> {
+  await request.jwtVerify();
+  const payload = request.user as { role?: string; username?: string };
+  if (payload.role !== 'admin' || !payload.username) throw new Error('admin token required');
+  return { role: 'admin', username: payload.username };
 }
 
 export function hashToken(value: string) {
@@ -53,4 +68,8 @@ export async function verifyCaptcha(phone: string, code: string, fixedAllowed: b
 
 export async function passwordHash(value: string) {
   return bcrypt.hash(value, 10);
+}
+
+export async function verifyPassword(value: string, hash: string) {
+  return bcrypt.compare(value, hash);
 }

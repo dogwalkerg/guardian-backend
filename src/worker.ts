@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { pool } from './db.js';
+import { pool, ensureRuntimeSchema } from './db.js';
 
 const intervalMs = Number(process.env.WORKER_INTERVAL_MS ?? 15_000);
 
@@ -10,6 +10,7 @@ async function expireCommands() {
 
 async function run() {
   console.log(`guardian worker started, interval=${intervalMs}ms`);
+  await ensureRuntimeSchema();
   await expireCommands();
   setInterval(() => expireCommands().catch((error) => console.error('worker tick failed', error)), intervalMs);
 }

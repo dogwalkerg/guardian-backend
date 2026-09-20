@@ -24,7 +24,7 @@ export type DeviceMessage = {
   messageId?: string;
   command?: string;
   deviceId?: string;
-  payload?: Record<string, unknown>;
+  payload?: Record<string, any>;
   status?: string;
-  result?: Record<string, unknown>;
+  result?: Record<string, any>;
 };

@@ -1,0 +1,11 @@
+[Unit]
+Description=Guardian Docker image updater
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+Environment=GUARDIAN_COMPOSE_DIR=/root/guardian
+Environment=GUARDIAN_RUNTIME_DIR=/root/guardian/runtime
+Environment=GUARDIAN_IMAGE_REPOSITORY=ghcr.io/dogwalkerg/guardian-backend
+ExecStart=/root/guardian/deploy/guardian-updater.sh

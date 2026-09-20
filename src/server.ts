@@ -8,7 +8,7 @@ import fastifyStatic from '@fastify/static';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { config } from './config.js';
-import { pool } from './db.js';
+import { pool, ensureRuntimeSchema } from './db.js';
 import { registerRoutes } from './routes.js';
 
 const app = Fastify({
@@ -25,6 +25,7 @@ await app.register(jwt, { secret: config.jwtSecret, sign: { expiresIn: '30d' } }
 await app.register(rateLimit, { max: 120, timeWindow: '1 minute' });
 await app.register(websocket);
 await app.register(fastifyStatic, { root: path.join(path.dirname(fileURLToPath(import.meta.url)), '../public'), prefix: '/admin/' });
+await ensureRuntimeSchema();
 await registerRoutes(app);
 app.get('/', async (_request, reply) => reply.redirect('/admin/'));
 app.get('/admin', async (_request, reply) => reply.redirect('/admin/'));

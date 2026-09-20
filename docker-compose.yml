@@ -1,10 +1,15 @@
 services:
   guardian-api:
-    build: .
+    build:
+      context: .
+      args:
+        APP_VERSION: ${APP_VERSION:-dev}
     image: ${GUARDIAN_IMAGE:-ghcr.io/dogwalkerg/guardian-backend:latest}
     container_name: guardian-api
     restart: unless-stopped
     env_file: .env
+    volumes:
+      - ./runtime:/app/runtime
     ports:
       - "127.0.0.1:18080:3000"
     depends_on:
@@ -25,6 +30,8 @@ services:
     container_name: guardian-worker
     restart: unless-stopped
     env_file: .env
+    volumes:
+      - ./runtime:/app/runtime
     command: ["node", "dist/worker.js"]
     depends_on:
       guardian-postgres:

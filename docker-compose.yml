@@ -1,0 +1,77 @@
+services:
+  guardian-api:
+    build: .
+    image: ${GUARDIAN_IMAGE:-ghcr.io/dogwalkerg/guardian-backend:latest}
+    container_name: guardian-api
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:18080:3000"
+    depends_on:
+      guardian-postgres:
+        condition: service_healthy
+      guardian-redis:
+        condition: service_healthy
+    networks: [guardian-net]
+    mem_limit: 384m
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  guardian-worker:
+    image: ${GUARDIAN_IMAGE:-ghcr.io/dogwalkerg/guardian-backend:latest}
+    container_name: guardian-worker
+    restart: unless-stopped
+    env_file: .env
+    command: ["node", "dist/worker.js"]
+    depends_on:
+      guardian-postgres:
+        condition: service_healthy
+    networks: [guardian-net]
+    mem_limit: 160m
+
+  guardian-postgres:
+    image: postgres:16-alpine
+    container_name: guardian-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: guardian
+      POSTGRES_USER: guardian
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - guardian_postgres_data:/var/lib/postgresql/data
+      - ./db/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
+    networks: [guardian-net]
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U guardian -d guardian"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  guardian-redis:
+    image: redis:7-alpine
+    container_name: guardian-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "96mb", "--maxmemory-policy", "allkeys-lru"]
+    volumes:
+      - guardian_redis_data:/data
+    networks: [guardian-net]
+    mem_limit: 128m
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+networks:
+  guardian-net:
+    driver: bridge
+
+volumes:
+  guardian_postgres_data:
+  guardian_redis_data:
+
+

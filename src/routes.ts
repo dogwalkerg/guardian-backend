@@ -512,6 +512,38 @@ export async function registerRoutes(app: FastifyInstance) {
     return { data: result.rows[0] };
   });
 
+  // Permanently remove one parent account and the complete family tree. This
+  // is intentionally admin-only: deleting the family cascades to children,
+  // devices, policies, app inventories, locations, usage, commands and bind
+  // tokens through the database foreign keys. Close live sockets first so an
+  // already-open child client cannot continue using a deleted device token.
+  app.delete('/api/v1/admin/families/:familyId', async (request: any, reply: any) => {
+    const admin = await requireAdmin(request, reply); if (!admin) return;
+    const familyId = String(request.params.familyId ?? '').trim();
+    if (!familyId) return reply.code(400).send({ message: 'familyId is required' });
+    const family = await query<{ owner_user_id: string; phone: string; child_count: string }>(
+      `SELECT f.owner_user_id,u.phone,(SELECT count(*)::text FROM children c WHERE c.family_id=f.id) AS child_count
+       FROM families f JOIN users u ON u.id=f.owner_user_id WHERE f.id=$1`, [familyId]
+    );
+    if (!family.rows[0]) return reply.code(404).send({ message: '家庭不存在' });
+    const devices = await query<{ id: string }>(
+      'SELECT d.id FROM devices d JOIN children c ON c.id=d.child_id WHERE c.family_id=$1', [familyId]
+    );
+    for (const device of devices.rows) {
+      const socket = deviceSockets.get(device.id);
+      if (socket) { try { socket.close(4003, 'family deleted'); } catch { /* already closed */ } deviceSockets.delete(device.id); }
+    }
+    await query('INSERT INTO admin_audit_logs(username,action,family_id,detail) VALUES($1,$2,$3,$4::jsonb)', [
+      admin.username, 'family_deleted', familyId,
+      JSON.stringify({ ownerPhone: family.rows[0].phone, childCount: Number(family.rows[0].child_count ?? 0) })
+    ]);
+    // The owner_user_id foreign key cascades family deletion; delete the
+    // family explicitly so all child/device records are removed immediately.
+    await query('DELETE FROM families WHERE id=$1', [familyId]);
+    await query('DELETE FROM users WHERE id=$1', [family.rows[0].owner_user_id]);
+    return { data: { familyId, deleted: true } };
+  });
+
   app.get('/api/v1/admin/families/:familyId/membership', async (request: any, reply) => {
     const admin = await requireAdmin(request, reply); if (!admin) return;
     const result = await query(`SELECT f.id AS "familyId",u.phone,e.enabled,e.expires_at AS "expiresAt",e.granted_by AS "grantedBy",e.updated_at AS "updatedAt" FROM families f JOIN users u ON u.id=f.owner_user_id LEFT JOIN parent_entitlements e ON e.family_id=f.id WHERE f.id=$1`, [request.params.familyId]);

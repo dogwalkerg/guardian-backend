@@ -635,6 +635,32 @@ export async function registerRoutes(app: FastifyInstance) {
     const result = await query(`SELECT id,event_type AS "eventType",payload,created_at AS "createdAt" FROM device_events WHERE child_id=$1 ORDER BY created_at DESC LIMIT 200`, [request.params.childId]);
     return { data: result.rows };
   });
+  app.delete('/api/v1/admin/children/:childId', async (request: any, reply: any) => {
+    const admin = await requireAdmin(request, reply); if (!admin) return;
+    const childId = String(request.params.childId ?? '').trim();
+    const found = await query<{ family_id: string; name: string; device_count: string }>(`SELECT c.family_id,c.name,(SELECT count(*)::text FROM devices d WHERE d.child_id=c.id) AS device_count FROM children c WHERE c.id=$1`, [childId]);
+    if (!found.rows[0]) return reply.code(404).send({ message: '孩子不存在' });
+    const devices = await query<{ id: string }>('SELECT id FROM devices WHERE child_id=$1', [childId]);
+    for (const device of devices.rows) { const socket = deviceSockets.get(device.id); if (socket) { try { socket.close(4003, 'child deleted'); } catch {} deviceSockets.delete(device.id); } }
+    await query('INSERT INTO admin_audit_logs(username,action,family_id,child_id,detail) VALUES($1,$2,$3,$4,$5::jsonb)', [admin.username, 'child_deleted', found.rows[0].family_id, childId, JSON.stringify({ name: found.rows[0].name, deviceCount: Number(found.rows[0].device_count ?? 0) })]);
+    await query('DELETE FROM bind_tokens WHERE child_id=$1', [childId]);
+    await query('DELETE FROM children WHERE id=$1', [childId]);
+    return { data: { childId, deleted: true, deviceCount: Number(found.rows[0].device_count ?? 0) } };
+  });
+
+  app.delete('/api/v1/admin/children/:childId/data', async (request: any, reply: any) => {
+    const admin = await requireAdmin(request, reply); if (!admin) return;
+    const childId = String(request.params.childId ?? '').trim();
+    const exists = await query('SELECT family_id FROM children WHERE id=$1', [childId]);
+    if (!exists.rows[0]) return reply.code(404).send({ message: '孩子不存在' });
+    const body = (request.body ?? {}) as Record<string, any>; const deleted: Record<string, number> = {};
+    const purge = async (key: string, table: string) => { if (body[key] !== true) return; const result = await query(`DELETE FROM ${table} WHERE child_id=$1 RETURNING id`, [childId]); deleted[key] = result.rowCount ?? result.rows.length; };
+    await purge('location', 'location_records'); await purge('usage', 'usage_records'); await purge('steps', 'step_records'); await purge('events', 'device_events'); await purge('commands', 'commands'); await purge('apps', 'installed_apps'); await purge('operationLogs', 'operation_logs');
+    if (!Object.keys(deleted).length) return reply.code(400).send({ message: '至少选择一种需要清理的数据' });
+    await query('INSERT INTO admin_audit_logs(username,action,child_id,detail) VALUES($1,$2,$3,$4::jsonb)', [admin.username, 'child_data_purged', childId, JSON.stringify(deleted)]);
+    return { data: deleted };
+  });
+
   app.get('/api/v1/admin/logs', async (request: any, reply) => {
     if (!await requireAdmin(request, reply)) return;
     const result = await query(`SELECT id,username,action,family_id AS "familyId",child_id AS "childId",device_id AS "deviceId",detail,created_at AS "createdAt" FROM admin_audit_logs ORDER BY created_at DESC LIMIT 300`);

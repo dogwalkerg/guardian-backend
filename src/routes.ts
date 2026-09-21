@@ -119,6 +119,59 @@ function splitIds(value: unknown): string[] {
   return String(value).split(',').map((item) => item.trim()).filter(Boolean);
 }
 
+/**
+ * Accept the six-digit code as well as the URI-shaped values produced by
+ * older parent builds.  Those builds appended `?code=` to the URL returned
+ * by the server, so a scanner can submit values such as
+ * `guardian://bind?...&code=123456?code=123456` instead of just `123456`.
+ * Keep the tolerance at the API boundary so existing installed APKs can be
+ * upgraded independently.
+ */
+function normalizeBindCode(value: unknown, depth = 0): string {
+  if (depth > 3 || value === undefined || value === null) return '';
+  if (typeof value === 'object') {
+    const object = value as Record<string, unknown>;
+    for (const key of ['code', 'bindCode', 'bindToken', 'token']) {
+      const normalized = normalizeBindCode(object[key], depth + 1);
+      if (normalized) return normalized;
+    }
+    return '';
+  }
+
+  const raw = String(value).trim();
+  if (!raw) return '';
+  if (/^\d{6}$/.test(raw)) return raw;
+
+  // Some QR readers return a JSON string rather than the URI itself.
+  if (raw.startsWith('{') || raw.startsWith('[')) {
+    try {
+      const normalized = normalizeBindCode(JSON.parse(raw), depth + 1);
+      if (normalized) return normalized;
+    } catch {
+      // Continue with URI/text parsing for malformed or partially decoded data.
+    }
+  }
+
+  // Prefer values explicitly attached to a code-like query parameter.  This
+  // also handles a duplicated `?code=` suffix in the parameter value.
+  const queryValue = raw.match(/(?:[?&#]|^)(?:code|bindCode|bindToken|token)=([^&#]*)/i)?.[1];
+  if (queryValue) {
+    const normalized = normalizeBindCode(queryValue, depth + 1);
+    if (normalized) return normalized;
+  }
+  try {
+    const parsed = new URL(raw);
+    for (const key of ['code', 'bindCode', 'bindToken', 'token']) {
+      const normalized = normalizeBindCode(parsed.searchParams.get(key), depth + 1);
+      if (normalized) return normalized;
+    }
+  } catch {
+    // Not a URL; the standalone six-digit fallback below still applies.
+  }
+
+  return raw.match(/(?<!\d)\d{6}(?!\d)/)?.[0] ?? '';
+}
+
 async function reverseGeocode(latitude: number, longitude: number): Promise<{ address: string | null; city: string | null; details: string | null }> {
   const enabled = (process.env.LOCATION_GEOCODER_ENABLED ?? 'true').toLowerCase() === 'true';
   if (!enabled) return { address: null, city: null, details: null };
@@ -1038,7 +1091,7 @@ export async function registerRoutes(app: FastifyInstance) {
   app.post('/api/v1/parent/device/systemLog', async (request: any) => { const user=await getAuthUser(app,request); const b=request.body??{}; await query('INSERT INTO operation_logs(family_id,user_id,child_id,device_id,action,detail) VALUES ($1,$2,$3,$4,$5,$6::jsonb)',[user.familyId,user.id,b.childId??null,b.deviceId??null,'system_log',JSON.stringify(b)]); return {data:true}; });
 
   app.post('/api/v1/device/register', async (request: any, reply) => {
-    const b=request.body??{}; const bindToken=String(b.bindToken??b.bindCode??''); const token=String(b.deviceToken??b.token??randomUUID());
+    const b=request.body??{}; const bindToken=normalizeBindCode(b.bindToken || b.bindCode || b.code); const token=String(b.deviceToken??b.token??randomUUID());
     const found=await query<{child_id:string;family_id:string}>('SELECT child_id,family_id FROM bind_tokens WHERE token=$1 AND used_at IS NULL AND expires_at>now()',[bindToken]);
     if(!found.rows[0]) return reply.code(400).send({message:'绑定码无效或已过期'});
     const row=await query<{id:string}>('INSERT INTO devices(child_id,device_token_hash,device_name,brand,model,android_version,client_version,metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb) RETURNING id',[found.rows[0].child_id,hashToken(token),b.deviceName??null,b.brand??null,b.model??null,b.androidVersion??null,b.clientVersion??null,JSON.stringify(b.metadata??{})]);
@@ -1056,7 +1109,7 @@ export async function registerRoutes(app: FastifyInstance) {
   app.post('/api/v1/device/uploadApps', async (request:any,reply)=>{const device=await findDevice(request);if(!device)return reply.code(401).send({message:'device unauthorized'});await handleDeviceMessage(device.id,{type:'apps',payload:request.body??{}});return {data:{ok:true}};});
 
   const childDevice = async (request: any, reply: any) => { const device = await findDevice(request); if (!device) { await reply.code(401).send({ message: 'device unauthorized' }); return null; } return device; };
-  app.post('/api/v1/child/childUser/bindChild', async (request: any, reply: any) => { const b=request.body??{}; const bindToken=String(b.bindToken??b.bindCode??b.code??''); const token=String(b.deviceToken??b.token??randomUUID()); const found=await query<{child_id:string}>('SELECT child_id FROM bind_tokens WHERE token=$1 AND used_at IS NULL AND expires_at>now()',[bindToken]); if(!found.rows[0])return reply.code(400).send({message:'绑定码无效或已过期'}); const row=await query<{id:string}>('INSERT INTO devices(child_id,device_token_hash,device_name,brand,model,android_version,client_version,metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb) RETURNING id',[found.rows[0].child_id,hashToken(token),b.deviceName??null,b.brand??null,b.model??null,b.androidVersion??null,b.clientVersion??null,JSON.stringify(b.metadata??{})]); await query(`UPDATE children c SET name='孩子'||right(u.phone,4),updated_at=now() FROM families f JOIN users u ON u.id=f.owner_user_id WHERE c.id=$1 AND c.family_id=f.id AND (c.name IS NULL OR trim(c.name)='' OR c.name='孩子')`, [found.rows[0].child_id]); await query('UPDATE bind_tokens SET used_at=now() WHERE token=$1',[bindToken]); return {code:0,data:{deviceId:row.rows[0].id,token,deviceToken:token,childId:found.rows[0].child_id,childType:0,expires_in:0}}; });
+  app.post('/api/v1/child/childUser/bindChild', async (request: any, reply: any) => { const b=request.body??{}; const bindToken=normalizeBindCode(b.bindToken || b.bindCode || b.code); const token=String(b.deviceToken??b.token??randomUUID()); const found=await query<{child_id:string}>('SELECT child_id FROM bind_tokens WHERE token=$1 AND used_at IS NULL AND expires_at>now()',[bindToken]); if(!found.rows[0])return reply.code(400).send({message:'绑定码无效或已过期'}); const row=await query<{id:string}>('INSERT INTO devices(child_id,device_token_hash,device_name,brand,model,android_version,client_version,metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb) RETURNING id',[found.rows[0].child_id,hashToken(token),b.deviceName??null,b.brand??null,b.model??null,b.androidVersion??null,b.clientVersion??null,JSON.stringify(b.metadata??{})]); await query(`UPDATE children c SET name='孩子'||right(u.phone,4),updated_at=now() FROM families f JOIN users u ON u.id=f.owner_user_id WHERE c.id=$1 AND c.family_id=f.id AND (c.name IS NULL OR trim(c.name)='' OR c.name='孩子')`, [found.rows[0].child_id]); await query('UPDATE bind_tokens SET used_at=now() WHERE token=$1',[bindToken]); return {code:0,data:{deviceId:row.rows[0].id,token,deviceToken:token,childId:found.rows[0].child_id,childType:0,expires_in:0}}; });
   app.get('/api/v1/child/childUser/getChildToken', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; return {data:{deviceId:device.id,childId:device.child_id}}; });
   app.get('/api/v1/child/childUser/getChildInfo', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; const result=await query(`SELECT c.id AS "childId",c.name,c.phone,c.family_id AS "familyId" FROM children c WHERE c.id=$1`,[device.child_id]); return {data:result.rows[0]??null}; });
   app.get('/api/v1/child/childUser/get/:id', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; const result=await query(`SELECT c.id AS "childId",c.name,c.phone,c.avatar_url AS "avatarUrl",c.family_id AS "familyId" FROM children c WHERE c.id=$1 AND c.id=$2`,[device.child_id,request.params.id]); return {data:result.rows[0]??null}; });

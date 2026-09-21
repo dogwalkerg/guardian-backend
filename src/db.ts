@@ -39,6 +39,11 @@ export async function ensureRuntimeSchema() {
     `ALTER TABLE devices ADD COLUMN IF NOT EXISTS dpm_api_level INTEGER`,
     `ALTER TABLE devices ADD COLUMN IF NOT EXISTS dpm_restrictions JSONB NOT NULL DEFAULT '{}'::jsonb`,
     `ALTER TABLE devices ADD COLUMN IF NOT EXISTS dpm_last_sync_at TIMESTAMPTZ`,
+    `ALTER TABLE installed_apps ADD COLUMN IF NOT EXISTS app_id VARCHAR(255)`,
+    `ALTER TABLE delete_tasks ADD COLUMN IF NOT EXISTS task_set_id UUID`,
+    `ALTER TABLE location_records ADD COLUMN IF NOT EXISTS address_details TEXT`,
+    `ALTER TABLE location_records ADD COLUMN IF NOT EXISTS city VARCHAR(160)`,
+    `ALTER TABLE location_records ADD COLUMN IF NOT EXISTS location_msg TEXT`,
     `CREATE TABLE IF NOT EXISTS child_app_settings (
       child_id UUID PRIMARY KEY REFERENCES children(id) ON DELETE CASCADE,
       allow_new_apps BOOLEAN NOT NULL DEFAULT true,
@@ -131,6 +136,14 @@ export async function ensureRuntimeSchema() {
       used_by UUID REFERENCES users(id) ON DELETE SET NULL,
       used_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`
+    ,`CREATE TABLE IF NOT EXISTS parent_entitlements (
+      family_id UUID PRIMARY KEY REFERENCES families(id) ON DELETE CASCADE,
+      enabled BOOLEAN NOT NULL DEFAULT false,
+      expires_at TIMESTAMPTZ,
+      granted_by VARCHAR(120),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )`
   ];
   for (const statement of statements) await pool.query(statement);

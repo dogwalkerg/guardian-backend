@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS devices (
 CREATE TABLE IF NOT EXISTS installed_apps (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   device_id UUID NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  app_id VARCHAR(255),
   package_name VARCHAR(255) NOT NULL,
   app_name VARCHAR(255) NOT NULL,
   version_name VARCHAR(80),
@@ -132,6 +133,9 @@ CREATE TABLE IF NOT EXISTS location_records (
   longitude NUMERIC(10,7) NOT NULL,
   accuracy NUMERIC(10,2),
   address TEXT,
+  address_details TEXT,
+  city VARCHAR(160),
+  location_msg TEXT,
   recorded_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   source VARCHAR(40)
 );
@@ -179,6 +183,15 @@ CREATE TABLE IF NOT EXISTS parent_active_codes (
   used_by UUID REFERENCES users(id) ON DELETE SET NULL,
   used_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS parent_entitlements (
+  family_id UUID PRIMARY KEY REFERENCES families(id) ON DELETE CASCADE,
+  enabled BOOLEAN NOT NULL DEFAULT false,
+  expires_at TIMESTAMPTZ,
+  granted_by VARCHAR(120),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS bind_tokens (
@@ -259,6 +272,7 @@ CREATE INDEX IF NOT EXISTS idx_steps_child_day ON step_records(child_id, day, re
 
 CREATE TABLE IF NOT EXISTS delete_tasks (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  task_set_id UUID,
   child_id UUID NOT NULL REFERENCES children(id) ON DELETE CASCADE,
   device_id UUID REFERENCES devices(id) ON DELETE SET NULL,
   package_name VARCHAR(255) NOT NULL,

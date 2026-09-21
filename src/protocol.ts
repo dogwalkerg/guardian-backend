@@ -20,7 +20,9 @@ export const DEVICE_EVENTS = {
 } as const;
 
 export type DeviceMessage = {
-  type: string;
+  type: string | number;
+  msgId?: number | string;
+  content?: string;
   messageId?: string;
   command?: string;
   deviceId?: string;

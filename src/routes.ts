@@ -802,7 +802,12 @@ export async function registerRoutes(app: FastifyInstance) {
 
   app.get('/api/v1/parent/index/childUserList', async (request: any) => {
     const user = await getAuthUser(app, request);
-    const result = await query(`SELECT c.id AS "childId",COALESCE(NULLIF(c.name,''),'孩子'||right(u.phone,4)) AS name,COALESCE(NULLIF(c.name,''),'孩子'||right(u.phone,4)) AS "nickName",COALESCE(NULLIF(c.name,''),'孩子'||right(u.phone,4)) AS "childName",c.phone,c.avatar_url AS "avatarUrl",d.id AS "deviceId",d.device_name AS "phoneName",d.brand,COALESCE(d.model,d.brand,d.device_name,'Android') AS model,COALESCE(d.model,d.brand,d.device_name,'Android') AS "phoneModel",d.android_version AS "androidVersion",d.client_version AS "clientVersion",d.online,CASE WHEN COALESCE(d.online,false) THEN 1 ELSE 0 END AS status,CASE WHEN COALESCE(d.online,false) THEN 1 ELSE 0 END AS "onLineStatus",d.battery,COALESCE(d.battery,0) AS "batteryPercent",d.last_seen_at AS "lastSeenAt",COALESCE(e.enabled,false) AND (e.expires_at IS NULL OR e.expires_at>now()) AS "isDeviceVip",COALESCE(e.enabled,false) AND (e.expires_at IS NULL OR e.expires_at>now()) AS "deviceVip" FROM children c JOIN families f ON f.id=c.family_id JOIN users u ON u.id=f.owner_user_id LEFT JOIN parent_entitlements e ON e.family_id=f.id LEFT JOIN LATERAL (SELECT * FROM devices x WHERE x.child_id=c.id ORDER BY x.updated_at DESC LIMIT 1) d ON true WHERE c.family_id=$1 AND c.active=true ORDER BY c.created_at`, [user.familyId]);
+    // A child record is only a real binding while it has a device row. Older
+    // versions marked only the device as removed, leaving orphaned active
+    // children that the parent app kept displaying forever. Keep the API
+    // compatible while hiding those stale records; a newly generated bind
+    // code will appear after the child device completes registration.
+    const result = await query(`SELECT c.id AS "childId",COALESCE(NULLIF(c.name,''),'孩子'||right(u.phone,4)) AS name,COALESCE(NULLIF(c.name,''),'孩子'||right(u.phone,4)) AS "nickName",COALESCE(NULLIF(c.name,''),'孩子'||right(u.phone,4)) AS "childName",c.phone,c.avatar_url AS "avatarUrl",d.id AS "deviceId",d.device_name AS "phoneName",d.brand,COALESCE(d.model,d.brand,d.device_name,'Android') AS model,COALESCE(d.model,d.brand,d.device_name,'Android') AS "phoneModel",d.android_version AS "androidVersion",d.client_version AS "clientVersion",d.online,CASE WHEN COALESCE(d.online,false) THEN 1 ELSE 0 END AS status,CASE WHEN COALESCE(d.online,false) THEN 1 ELSE 0 END AS "onLineStatus",d.battery,COALESCE(d.battery,0) AS "batteryPercent",d.last_seen_at AS "lastSeenAt",COALESCE(e.enabled,false) AND (e.expires_at IS NULL OR e.expires_at>now()) AS "isDeviceVip",COALESCE(e.enabled,false) AND (e.expires_at IS NULL OR e.expires_at>now()) AS "deviceVip" FROM children c JOIN families f ON f.id=c.family_id JOIN users u ON u.id=f.owner_user_id LEFT JOIN parent_entitlements e ON e.family_id=f.id LEFT JOIN LATERAL (SELECT * FROM devices x WHERE x.child_id=c.id ORDER BY x.updated_at DESC LIMIT 1) d ON true WHERE c.family_id=$1 AND c.active=true AND d.id IS NOT NULL ORDER BY c.created_at`, [user.familyId]);
     return { data: result.rows };
   });
 
@@ -1021,11 +1026,11 @@ export async function registerRoutes(app: FastifyInstance) {
     // active code so opening the page does not create duplicate children/codes.
     const active = childId
       ? await query<{ token: string; child_id: string; expires_at: string }>(
-        `SELECT b.token,b.child_id,b.expires_at FROM bind_tokens b JOIN children c ON c.id=b.child_id WHERE b.family_id=$1 AND b.used_at IS NULL AND b.expires_at>now() AND b.child_id=$2::uuid ORDER BY b.created_at DESC LIMIT 1`,
+        `SELECT b.token,b.child_id,b.expires_at FROM bind_tokens b JOIN children c ON c.id=b.child_id AND c.active=true WHERE b.family_id=$1 AND b.used_at IS NULL AND b.expires_at>now() AND b.child_id=$2::uuid ORDER BY b.created_at DESC LIMIT 1`,
         [user.familyId, childId]
       )
       : await query<{ token: string; child_id: string; expires_at: string }>(
-        `SELECT b.token,b.child_id,b.expires_at FROM bind_tokens b JOIN children c ON c.id=b.child_id WHERE b.family_id=$1 AND b.used_at IS NULL AND b.expires_at>now() ORDER BY b.created_at DESC LIMIT 1`,
+        `SELECT b.token,b.child_id,b.expires_at FROM bind_tokens b JOIN children c ON c.id=b.child_id AND c.active=true WHERE b.family_id=$1 AND b.used_at IS NULL AND b.expires_at>now() ORDER BY b.created_at DESC LIMIT 1`,
         [user.familyId]
       );
     let token = active.rows[0]?.token ?? '';
@@ -1050,7 +1055,33 @@ export async function registerRoutes(app: FastifyInstance) {
     return { code: 0, data: { code: token, bindCode: token, childId, url, content: url, expiresIn: remaining, expiresAt } };
   });
 
-  const removeDevice = async (request: any) => { const user = await getAuthUser(app, request); const b=request.body??{}; const childId=String(b.childId ?? (request.query as any)?.childId ?? ''); await query(`DELETE FROM devices d USING children c WHERE d.child_id=$1 AND c.id=d.child_id AND c.family_id=$2`,[childId,user.familyId]); return {data:true}; };
+  const removeDevice = async (request: any, reply: any) => {
+    const user = await getAuthUser(app, request);
+    const b = request.body ?? {};
+    const childId = String(b.childId ?? (request.query as any)?.childId ?? '').trim();
+    if (!childId) return reply.code(400).send({ message: 'childId is required' });
+    const devices = await query<{ id: string }>(
+      `SELECT d.id FROM devices d JOIN children c ON c.id=d.child_id WHERE d.child_id=$1 AND c.family_id=$2`,
+      [childId, user.familyId]
+    );
+    if (!devices.rows.length) {
+      // Also repair orphaned records left by the old endpoint.
+      await query(`UPDATE children SET active=false,updated_at=now() WHERE id=$1 AND family_id=$2`, [childId, user.familyId]);
+      await query(`DELETE FROM bind_tokens WHERE child_id=$1 AND family_id=$2`, [childId, user.familyId]);
+      return { data: true };
+    }
+    for (const device of devices.rows) {
+      const socket = deviceSockets.get(device.id);
+      if (socket) {
+        try { socket.close(4002, 'device unbound'); } catch { /* already closed */ }
+        deviceSockets.delete(device.id);
+      }
+    }
+    await query(`DELETE FROM devices d USING children c WHERE d.child_id=$1 AND c.id=d.child_id AND c.family_id=$2`, [childId, user.familyId]);
+    await query(`UPDATE children SET active=false,updated_at=now() WHERE id=$1 AND family_id=$2`, [childId, user.familyId]);
+    await query(`DELETE FROM bind_tokens WHERE child_id=$1 AND family_id=$2`, [childId, user.familyId]);
+    return { data: true };
+  };
   app.delete('/api/v1/parent/user/removeDevice', removeDevice); app.get('/api/v1/parent/user/removeDevice', removeDevice);
   const updateChild = async (request: any) => { const user=await getAuthUser(app,request);const b=request.body??{}; await query(`UPDATE children c SET name=COALESCE($3,c.name),phone=COALESCE($4,c.phone),updated_at=now() FROM families f WHERE c.id=$1 AND c.family_id=f.id AND f.id=$2`,[b.childId,user.familyId,b.name,b.phone]); return {data:true}; };
   app.put('/api/v1/parent/user/updateChild', updateChild); app.post('/api/v1/parent/user/updateChild', updateChild);
@@ -1092,10 +1123,10 @@ export async function registerRoutes(app: FastifyInstance) {
 
   app.post('/api/v1/device/register', async (request: any, reply) => {
     const b=request.body??{}; const bindToken=normalizeBindCode(b.bindToken || b.bindCode || b.code); const token=String(b.deviceToken??b.token??randomUUID());
-    const found=await query<{child_id:string;family_id:string}>('SELECT child_id,family_id FROM bind_tokens WHERE token=$1 AND used_at IS NULL AND expires_at>now()',[bindToken]);
+    const found=await query<{child_id:string;family_id:string}>('SELECT b.child_id,b.family_id FROM bind_tokens b JOIN children c ON c.id=b.child_id WHERE b.token=$1 AND b.used_at IS NULL AND b.expires_at>now()',[bindToken]);
     if(!found.rows[0]) return reply.code(400).send({message:'绑定码无效或已过期'});
     const row=await query<{id:string}>('INSERT INTO devices(child_id,device_token_hash,device_name,brand,model,android_version,client_version,metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb) RETURNING id',[found.rows[0].child_id,hashToken(token),b.deviceName??null,b.brand??null,b.model??null,b.androidVersion??null,b.clientVersion??null,JSON.stringify(b.metadata??{})]);
-    await query(`UPDATE children c SET name='孩子'||right(u.phone,4),updated_at=now() FROM families f JOIN users u ON u.id=f.owner_user_id WHERE c.id=$1 AND c.family_id=f.id AND (c.name IS NULL OR trim(c.name)='' OR c.name='孩子')`, [found.rows[0].child_id]);
+    await query(`UPDATE children c SET active=true,name=CASE WHEN c.name IS NULL OR trim(c.name)='' OR c.name='孩子' THEN '孩子'||right(u.phone,4) ELSE c.name END,updated_at=now() FROM families f JOIN users u ON u.id=f.owner_user_id WHERE c.id=$1 AND c.family_id=f.id`, [found.rows[0].child_id]);
     await query('UPDATE bind_tokens SET used_at=now() WHERE token=$1',[bindToken]);
     // The original child APK parses the credential as `data.token` and stores
     // `data.deviceId`. Keep the newer aliases as well for our own clients.
@@ -1109,14 +1140,22 @@ export async function registerRoutes(app: FastifyInstance) {
   app.post('/api/v1/device/uploadApps', async (request:any,reply)=>{const device=await findDevice(request);if(!device)return reply.code(401).send({message:'device unauthorized'});await handleDeviceMessage(device.id,{type:'apps',payload:request.body??{}});return {data:{ok:true}};});
 
   const childDevice = async (request: any, reply: any) => { const device = await findDevice(request); if (!device) { await reply.code(401).send({ message: 'device unauthorized' }); return null; } return device; };
-  app.post('/api/v1/child/childUser/bindChild', async (request: any, reply: any) => { const b=request.body??{}; const bindToken=normalizeBindCode(b.bindToken || b.bindCode || b.code); const token=String(b.deviceToken??b.token??randomUUID()); const found=await query<{child_id:string}>('SELECT child_id FROM bind_tokens WHERE token=$1 AND used_at IS NULL AND expires_at>now()',[bindToken]); if(!found.rows[0])return reply.code(400).send({message:'绑定码无效或已过期'}); const row=await query<{id:string}>('INSERT INTO devices(child_id,device_token_hash,device_name,brand,model,android_version,client_version,metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb) RETURNING id',[found.rows[0].child_id,hashToken(token),b.deviceName??null,b.brand??null,b.model??null,b.androidVersion??null,b.clientVersion??null,JSON.stringify(b.metadata??{})]); await query(`UPDATE children c SET name='孩子'||right(u.phone,4),updated_at=now() FROM families f JOIN users u ON u.id=f.owner_user_id WHERE c.id=$1 AND c.family_id=f.id AND (c.name IS NULL OR trim(c.name)='' OR c.name='孩子')`, [found.rows[0].child_id]); await query('UPDATE bind_tokens SET used_at=now() WHERE token=$1',[bindToken]); return {code:0,data:{deviceId:row.rows[0].id,token,deviceToken:token,childId:found.rows[0].child_id,childType:0,expires_in:0}}; });
+  app.post('/api/v1/child/childUser/bindChild', async (request: any, reply: any) => { const b=request.body??{}; const bindToken=normalizeBindCode(b.bindToken || b.bindCode || b.code); const token=String(b.deviceToken??b.token??randomUUID()); const found=await query<{child_id:string}>('SELECT b.child_id FROM bind_tokens b JOIN children c ON c.id=b.child_id WHERE b.token=$1 AND b.used_at IS NULL AND b.expires_at>now()',[bindToken]); if(!found.rows[0])return reply.code(400).send({message:'绑定码无效或已过期'}); const row=await query<{id:string}>('INSERT INTO devices(child_id,device_token_hash,device_name,brand,model,android_version,client_version,metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb) RETURNING id',[found.rows[0].child_id,hashToken(token),b.deviceName??null,b.brand??null,b.model??null,b.androidVersion??null,b.clientVersion??null,JSON.stringify(b.metadata??{})]); await query(`UPDATE children c SET active=true,name=CASE WHEN c.name IS NULL OR trim(c.name)='' OR c.name='孩子' THEN '孩子'||right(u.phone,4) ELSE c.name END,updated_at=now() FROM families f JOIN users u ON u.id=f.owner_user_id WHERE c.id=$1 AND c.family_id=f.id`, [found.rows[0].child_id]); await query('UPDATE bind_tokens SET used_at=now() WHERE token=$1',[bindToken]); return {code:0,data:{deviceId:row.rows[0].id,token,deviceToken:token,childId:found.rows[0].child_id,childType:0,expires_in:0}}; });
   app.get('/api/v1/child/childUser/getChildToken', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; return {data:{deviceId:device.id,childId:device.child_id}}; });
   app.get('/api/v1/child/childUser/getChildInfo', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; const result=await query(`SELECT c.id AS "childId",c.name,c.phone,c.family_id AS "familyId" FROM children c WHERE c.id=$1`,[device.child_id]); return {data:result.rows[0]??null}; });
   app.get('/api/v1/child/childUser/get/:id', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; const result=await query(`SELECT c.id AS "childId",c.name,c.phone,c.avatar_url AS "avatarUrl",c.family_id AS "familyId" FROM children c WHERE c.id=$1 AND c.id=$2`,[device.child_id,request.params.id]); return {data:result.rows[0]??null}; });
   app.get('/api/v1/child/childUser/parent', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; const result=await query(`SELECT u.id AS "parentId",u.phone,u.display_name AS "displayName",f.id AS "familyId",f.name AS "familyName" FROM children c JOIN families f ON f.id=c.family_id JOIN users u ON u.id=f.owner_user_id WHERE c.id=$1`,[device.child_id]); return {data:result.rows[0]??null}; });
   app.get('/api/v1/child/childUser/schoolChildDetail', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; const result=await query(`SELECT c.id AS "childId",c.name,c.phone,c.avatar_url AS "avatarUrl" FROM children c WHERE c.id=$1`,[device.child_id]); return {data:result.rows[0]??null}; });
   app.put('/api/v1/child/childUser/updateChildInfo', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; const b=request.body??{}; await query('UPDATE children SET name=COALESCE($2,name),phone=COALESCE($3,phone),updated_at=now() WHERE id=$1',[device.child_id,b.name??b.nickName??null,b.phone??null]); return {data:true}; });
-  app.post('/api/v1/child/childUser/unBind', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; await query('DELETE FROM devices WHERE id=$1',[device.id]); return {data:true}; });
+  app.post('/api/v1/child/childUser/unBind', async (request: any, reply: any) => {
+    const device = await childDevice(request, reply); if (!device) return;
+    const socket = deviceSockets.get(device.id);
+    if (socket) { try { socket.close(4002, 'device unbound'); } catch { /* already closed */ } deviceSockets.delete(device.id); }
+    await query('DELETE FROM devices WHERE id=$1', [device.id]);
+    await query('UPDATE children SET active=false,updated_at=now() WHERE id=$1', [device.child_id]);
+    await query('DELETE FROM bind_tokens WHERE child_id=$1', [device.child_id]);
+    return {data:true};
+  });
   app.post('/api/v1/child/childUser/changeChildPolicyInfo', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; const b=request.body??{}; await query(`INSERT INTO control_policies(child_id,name,enabled,no_play_enabled,lock_enabled,allow_call,emergency_numbers,periods,daily_limit_seconds,timezone) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9,$10) ON CONFLICT(child_id) DO UPDATE SET enabled=EXCLUDED.enabled,no_play_enabled=EXCLUDED.no_play_enabled,lock_enabled=EXCLUDED.lock_enabled,allow_call=EXCLUDED.allow_call,emergency_numbers=EXCLUDED.emergency_numbers,periods=EXCLUDED.periods,daily_limit_seconds=EXCLUDED.daily_limit_seconds,timezone=EXCLUDED.timezone,updated_at=now()`,[device.child_id,b.name??'默认管控策略',b.enabled??true,b.noPlayEnabled??false,b.lockEnabled??false,b.allowCall??true,JSON.stringify(b.emergencyNumbers??[]),JSON.stringify(b.periods??[]),b.dailyLimitSeconds??null,b.timezone??'Asia/Shanghai']); return {data:true}; });
   app.get('/api/v1/child/childUser/getChildStatus', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; const result=await query(`SELECT online,battery,network_type AS "networkType",last_seen_at AS "lastSeenAt",control_status AS "controlStatus",device_owner_enabled AS "deviceOwnerEnabled",dpm_restrictions AS "dpmRestrictions" FROM devices WHERE id=$1`,[device.id]); return {data:result.rows[0]??null}; });
   app.post('/api/v1/child/childUser/heartBeat', async (request: any, reply: any) => { const device=await childDevice(request,reply); if(!device)return; await markDevice(device.id,true,{lastHeartbeatAt:new Date().toISOString(),...(request.body??{})}); return {data:{ok:true}}; });
@@ -1242,8 +1281,8 @@ async function findDevice(request:any) {
   const deviceId = String(body.deviceId ?? queryParams.deviceId ?? request.headers['x-device-id'] ?? '');
   if(!supplied) return null;
   const result = deviceId
-    ? await query<{id:string;child_id:string}>('SELECT d.id,d.child_id FROM devices d JOIN children c ON c.id=d.child_id WHERE d.id=$1 AND d.device_token_hash=$2',[deviceId,hashToken(supplied)])
-    : await query<{id:string;child_id:string}>('SELECT d.id,d.child_id FROM devices d JOIN children c ON c.id=d.child_id WHERE d.device_token_hash=$1 LIMIT 1',[hashToken(supplied)]);
+    ? await query<{id:string;child_id:string}>('SELECT d.id,d.child_id FROM devices d JOIN children c ON c.id=d.child_id AND c.active=true WHERE d.id=$1 AND d.device_token_hash=$2',[deviceId,hashToken(supplied)])
+    : await query<{id:string;child_id:string}>('SELECT d.id,d.child_id FROM devices d JOIN children c ON c.id=d.child_id AND c.active=true WHERE d.device_token_hash=$1 LIMIT 1',[hashToken(supplied)]);
   return result.rows[0]??null;
 }
 

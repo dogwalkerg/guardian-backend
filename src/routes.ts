@@ -227,19 +227,22 @@ function normalizeLocationPayload(value: unknown): JsonRecord {
 
 async function storeInstalledApps(deviceId: string, messageType: string, value: unknown) {
   const apps = extractAppItems(value);
+  let withIcons = 0;
   for (const item of apps) {
     const packageName = String(nonEmpty(item.packageName, item.package_name, item.appPackageName, item.package, item.pkg) ?? '').trim();
     if (!packageName) continue;
     const appId = String(nonEmpty(item.appId, item.app_id, item.id, packageName) ?? packageName);
+    const icon = nonEmpty(item.iconUrl, item.icon_url, item.icon, item.iconBase64);
+    if (icon) withIcons += 1;
     await query(
       `INSERT INTO installed_apps(device_id,app_id,package_name,app_name,version_name,version_code,icon_url,is_system,last_seen_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,COALESCE($8,false),now())
-       ON CONFLICT(device_id,package_name) DO UPDATE SET app_id=EXCLUDED.app_id,app_name=EXCLUDED.app_name,version_name=EXCLUDED.version_name,version_code=EXCLUDED.version_code,icon_url=EXCLUDED.icon_url,is_system=EXCLUDED.is_system,last_seen_at=now()`,
-      [deviceId, appId, packageName, String(nonEmpty(item.appName, item.app_name, item.name, packageName)), nonEmpty(item.versionName, item.version_name, item.version), String(nonEmpty(item.versionCode, item.version_code, '') ?? ''), nonEmpty(item.iconUrl, item.icon_url, item.icon, item.iconBase64), item.isSystem ?? item.is_system ?? item.systemApp ?? false]
+       ON CONFLICT(device_id,package_name) DO UPDATE SET app_id=EXCLUDED.app_id,app_name=EXCLUDED.app_name,version_name=EXCLUDED.version_name,version_code=EXCLUDED.version_code,icon_url=COALESCE(NULLIF(EXCLUDED.icon_url,''),installed_apps.icon_url),is_system=EXCLUDED.is_system,last_seen_at=now()`,
+      [deviceId, appId, packageName, String(nonEmpty(item.appName, item.app_name, item.name, packageName)), nonEmpty(item.versionName, item.version_name, item.version), String(nonEmpty(item.versionCode, item.version_code, '') ?? ''), icon, item.isSystem ?? item.is_system ?? item.systemApp ?? false]
     );
   }
   await query('UPDATE devices SET last_apps_sync_at=now(),last_seen_at=now(),online=true,updated_at=now() WHERE id=$1', [deviceId]);
-  await recordDeviceEvent(deviceId, messageType, { count: apps.length });
+  await recordDeviceEvent(deviceId, messageType, { count: apps.length, withIcons });
   return apps.length;
 }
 

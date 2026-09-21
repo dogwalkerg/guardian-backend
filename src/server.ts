@@ -16,7 +16,9 @@ const app = Fastify({
     level: config.logLevel,
     transport: config.nodeEnv === 'development' ? { target: 'pino-pretty', options: { translateTime: 'SYS:standard' } } : undefined
   },
-  bodyLimit: 5 * 1024 * 1024
+  // A child device uploads one base64 PNG per installed application. A full
+  // application list can legitimately exceed the default Fastify limit.
+  bodyLimit: 20 * 1024 * 1024
 });
 
 await app.register(cors, { origin: config.corsOrigin, credentials: true });

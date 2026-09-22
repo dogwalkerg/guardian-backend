@@ -82,13 +82,24 @@ async function notifyDeviceUnbound(deviceId: string) {
   const socket = deviceSockets.get(deviceId);
   if (!socket || socket.readyState !== 1) return false;
   try {
-    socket.send(JSON.stringify(deviceWireMessage(COMMANDS.unbind, randomUUID(), {
+    const messageId = randomUUID();
+    const payload = {
       reason: 'admin_deleted',
       reset: true
-    })));
-    // Give the Android websocket callback a short scheduling window to clear
-    // SharedPreferences before the connection is closed and rows cascade.
-    await new Promise((resolve) => setTimeout(resolve, 350));
+    };
+    // The legacy APK dispatches by both numeric event type and enum id. The
+    // previous envelope used msgId=0 and an empty content field, so older
+    // builds silently ignored it and remained on the bound home screen.
+    const wire = deviceWireMessage(COMMANDS.unbind, messageId, payload) as any;
+    wire.msgId = 15;
+    wire.content = 'CHILD_REMOVE_DEVICE';
+    socket.send(JSON.stringify(wire));
+    // A second delivery covers a reconnect/race in the Android WebSocket
+    // callback. Keep the socket alive long enough for SharedPreferences to be
+    // cleared before removing the server-side device row.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    if (socket.readyState === 1) socket.send(JSON.stringify(wire));
+    await new Promise((resolve) => setTimeout(resolve, 1200));
     try { socket.close(4003, 'device unbound'); } catch { /* already closed */ }
     deviceSockets.delete(deviceId);
     return true;
